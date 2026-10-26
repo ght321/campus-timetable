@@ -51,6 +51,39 @@ test("desktop CRUD, conflict confirmation, search, persistence and deletion", as
   await expect(page.locator(".list-course")).toHaveCount(8);
   expect(errors).toEqual([]);
 });
+test("week navigation, semester validation, cross-year dates and empty state", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "下一周", exact: true }).click();
+  await expect(page.getByLabel("跳转教学周")).toHaveValue("8");
+  await page.getByRole("button", { name: "回到本周", exact: true }).click();
+  await expect(page.getByLabel("跳转教学周")).toHaveValue("7");
+  await page.getByLabel("跳转教学周").selectOption("20");
+  await expect(
+    page.getByText("第 20 周暂无课程，可以切换周次或新增课程。"),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "学期设置", exact: true }).click();
+  const form = page.getByRole("dialog", { name: "学期设置" });
+  await form.getByLabel("总教学周数", { exact: true }).fill("8");
+  await form.getByRole("button", { name: "保存学期" }).click();
+  await expect(form.getByRole("alert")).toContainText("课程第");
+  await form.getByLabel("总教学周数", { exact: true }).fill("20");
+  await form.getByLabel("每日课程节次", { exact: true }).fill("12");
+  await form.getByLabel("开学日期", { exact: true }).fill("2026-12-28");
+  await form.getByRole("button", { name: "保存学期" }).click();
+  await expect(page.getByText("学期尚未开始", { exact: false })).toBeVisible();
+  await page.getByLabel("跳转教学周").selectOption("2");
+  await expect(
+    page.getByText("点击课程查看详情 · 2027-01-04 至 2027-01-10"),
+  ).toBeVisible();
+  await expect(page.locator(".period-label")).toHaveCount(12);
+  await page.reload();
+  await page.getByRole("button", { name: "学期设置", exact: true }).click();
+  await expect(page.getByLabel("开学日期", { exact: true })).toHaveValue(
+    "2026-12-28",
+  );
+});
 test("corrupt data recovery preserves source until explicit reset", async ({
   page,
 }) => {
@@ -113,6 +146,58 @@ test("odd/even filter and overlap cards stay reachable", async ({ page }) => {
   ).toHaveCount(0);
   await page.getByLabel("仅第 8 周").check();
   await expect(page.locator(".list-course")).toHaveCount(2);
+});
+test("mobile layout, scrollable cards, keyboard dialog and screenshots", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  const scroll = page.locator(".schedule-scroll");
+  expect(await scroll.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(
+    true,
+  );
+  await page.locator(".course-card").filter({ hasText: "体育" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  expect(
+    await page.getByRole("dialog").evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return r.left >= 0 && r.right <= window.innerWidth;
+    }),
+  ).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.screenshot({
+    path: "docs/screenshots/mobile.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.screenshot({
+    path: "docs/screenshots/desktop.png",
+    fullPage: true,
+  });
+});
+test("long semester names stay inside the mobile viewport", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "学期设置", exact: true }).click();
+  await page.getByLabel("学期名称", { exact: true }).fill("A".repeat(100));
+  await page.getByRole("button", { name: "保存学期", exact: true }).click();
+  await page.reload();
+  await expect(page.locator(".semester-card strong")).toHaveText(
+    "A".repeat(100),
+  );
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
 });
 test("course CRUD and persistence work on an insecure HTTP origin", async ({
   page,
