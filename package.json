@@ -11,8 +11,8 @@
     "typecheck": "tsc -b && tsc -p tsconfig.tests.json",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "format": "prettier --write src docs *.json *.ts README.md",
-    "format:check": "prettier --check src docs *.json *.ts README.md"
+    "format": "prettier --write src tests docs *.json *.ts README.md",
+    "format:check": "prettier --check src tests docs *.json *.ts README.md"
   },
   "dependencies": {
     "react": "^19.3.1",
