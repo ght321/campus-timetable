@@ -8,7 +8,6 @@ import {
   weekDates,
 } from "../../src/utils/date";
 import { occurs, conflicts, courseLayout } from "../../src/utils/timetable";
-import type { Course } from "../../src/models";
 import {
   validateCourse,
   validateData,
@@ -19,13 +18,15 @@ import {
   deleteCourse,
   changeSemester,
 } from "../../src/features/courses/service";
+import { statistics } from "../../src/features/statistics/calculate";
+import { parseImport, serialize } from "../../src/services/importExport";
 import {
   loadData,
   saveData,
   STORAGE_KEY,
   type StoragePort,
 } from "../../src/services/storage";
-import { statistics } from "../../src/features/statistics/calculate";
+import type { Course } from "../../src/models";
 const data = demoData(),
   base = data.courses[0];
 const course = (patch: Partial<Course> = {}): Course => ({ ...base, ...patch });
@@ -202,6 +203,66 @@ describe("validation and CRUD", () => {
       validateData({ ...data, courses: Array(501).fill(base) }),
     ).toThrow("500");
   });
+});
+describe("import/export", () => {
+  it("round trips version 1", () =>
+    expect(parseImport(serialize(data), data.semester)).toEqual({
+      data,
+      legacy: false,
+    }));
+  it("converts the original repository export format", () => {
+    const old = {
+      school: "南京理工大学",
+      week: 7,
+      courses: [
+        {
+          id: 1,
+          name: "数学",
+          teacher: "张老师",
+          room: "101",
+          day: 1,
+          start: 1,
+          end: 2,
+          weeks: "1-16周",
+          color: "blue",
+        },
+      ],
+    };
+    const result = parseImport(JSON.stringify(old), data.semester);
+    expect(result.legacy).toBe(true);
+    expect(result.data.courses[0]).toMatchObject({
+      id: "1",
+      startWeek: 1,
+      endWeek: 16,
+      parity: "all",
+    });
+    expect(result.data.semester).toEqual(data.semester);
+  });
+  it.each([
+    "{",
+    "null",
+    "[]",
+    "{}",
+    '{"schemaVersion":99}',
+    '{"schemaVersion":1,"courses":[]}',
+  ])("rejects invalid imports %s", (json) =>
+    expect(() => parseImport(json, data.semester)).toThrow(),
+  );
+  it("rejects unsupported legacy weeks instead of guessing", () =>
+    expect(() =>
+      parseImport(
+        JSON.stringify({
+          school: "x",
+          week: 7,
+          courses: [{ ...base, weeks: "1,3,5周" }],
+        }),
+        data.semester,
+      ),
+    ).toThrow());
+  it("rejects oversized JSON", () =>
+    expect(() => parseImport(" ".repeat(2_000_001), data.semester)).toThrow(
+      "文件过大",
+    ));
 });
 describe("storage recovery", () => {
   const storage = (raw: string | null): StoragePort => ({

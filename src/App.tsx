@@ -17,7 +17,7 @@ import { Timetable } from "./components/Timetable/Timetable";
 import { CourseList } from "./components/Course/CourseList";
 import { CourseDetail } from "./components/Course/CourseDetail";
 import { CourseForm } from "./components/Course/CourseForm";
-import { downloadData } from "./services/importExport";
+import { DataTools } from "./components/Layout/DataTools";
 function App() {
   const { data, commit, storageMessage } = useTimetable();
   const today = useToday();
@@ -60,27 +60,23 @@ function App() {
             <span>校园课表管理平台</span>
           </div>
         </div>
-        <div className="header-right">
-          <button onClick={() => setSettings(true)}>学期设置</button>
-          <button className="primary-button" onClick={() => downloadData(data)}>
-            导出课表
-          </button>
-          <button
-            onClick={() => {
-              if (
-                window.confirm(
-                  "恢复演示数据将替换全部课程及学期设置，是否继续？",
-                )
-              ) {
-                const demo = demoData();
-                commit(demo, true);
-                setWeek(visibleWeek(demo.semester, today));
-              }
-            }}
-          >
-            恢复演示数据
-          </button>
-        </div>
+        <DataTools
+          data={data}
+          onSettings={() => setSettings(true)}
+          onReset={() => {
+            if (
+              window.confirm("恢复演示数据将替换全部课程及学期设置，是否继续？")
+            ) {
+              const demo = demoData();
+              commit(demo, true);
+              setWeek(visibleWeek(demo.semester, today));
+            }
+          }}
+          onImport={(next) => {
+            commit(next, true);
+            setWeek(visibleWeek(next.semester, today));
+          }}
+        />
       </header>
       <main className="container">
         <section className="welcome">

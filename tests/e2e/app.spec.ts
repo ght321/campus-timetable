@@ -84,6 +84,80 @@ test("week navigation, semester validation, cross-year dates and empty state", a
     "2026-12-28",
   );
 });
+test("JSON preview cancel/confirm, validation, export and legacy conversion", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const upload = page.getByLabel("选择课表JSON");
+  const next = { ...demoData(), courses: [] };
+  await upload.setInputFiles({
+    name: "empty.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(next)),
+  });
+  await expect(page.getByRole("dialog", { name: "导入预览" })).toContainText(
+    "共 0 条课程",
+  );
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.locator(".list-course")).toHaveCount(8);
+  await upload.setInputFiles({
+    name: "empty.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(next)),
+  });
+  await page.getByRole("button", { name: "确认替换（含冲突课程）" }).click();
+  await page.reload();
+  await expect(page.locator(".list-course")).toHaveCount(0);
+  await upload.setInputFiles({
+    name: "bad.json",
+    mimeType: "application/json",
+    buffer: Buffer.from("{bad"),
+  });
+  await expect(page.getByRole("alert")).toHaveText("JSON语法错误，请检查文件");
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
+  const old = {
+    school: "南京理工大学",
+    week: 7,
+    courses: [
+      {
+        id: 1,
+        name: "旧版数学",
+        teacher: "张老师",
+        room: "101",
+        day: 1,
+        start: 1,
+        end: 2,
+        weeks: "1-16周",
+        color: "blue",
+      },
+    ],
+  };
+  await upload.setInputFiles({
+    name: "legacy.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(old)),
+  });
+  await expect(
+    page.getByText("已转换旧版JSON：", { exact: false }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "确认替换（含冲突课程）" }).click();
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出课表", exact: true }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe("campus-timetable.json");
+  const stream = await download.createReadStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+  const exported = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  expect(exported.schemaVersion).toBe(1);
+  expect(exported.courses[0]).toMatchObject({
+    id: "1",
+    name: "旧版数学",
+    parity: "all",
+  });
+  await page.reload();
+  await expect(page.locator(".list-course")).toHaveCount(1);
+});
 test("corrupt data recovery preserves source until explicit reset", async ({
   page,
 }) => {
@@ -181,6 +255,7 @@ test("mobile layout, scrollable cards, keyboard dialog and screenshots", async (
     fullPage: true,
   });
 });
+
 test("long semester names stay inside the mobile viewport", async ({
   page,
 }) => {
@@ -199,6 +274,7 @@ test("long semester names stay inside the mobile viewport", async ({
     ),
   ).toBe(true);
 });
+
 test("course CRUD and persistence work on an insecure HTTP origin", async ({
   page,
 }) => {
