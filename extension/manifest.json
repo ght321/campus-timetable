@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "南理工课表同步到 CampusTimetable",
+  "version": "0.1.0",
+  "description": "在用户已登录的南京理工大学教务页面读取可见课表，并保存到本机课表网站。不会读取或上传登录密码。",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "http://127.0.0.1:3001/*",
+    "http://localhost:3001/*"
+  ],
+  "action": {
+    "default_title": "同步南理工课表",
+    "default_popup": "popup.html"
+  }
+}

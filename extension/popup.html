@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>南理工课表同步</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="panel">
+    <header>
+      <div class="logo">C</div>
+      <div>
+        <h1>南理工课表同步</h1>
+        <p>南京理工大学 · 本地同步</p>
+      </div>
+    </header>
+
+    <div class="privacy"><strong>隐私提示</strong>：仅读取你当前打开的页面；不会读取或上传密码。数据仅发送到本机的课表服务。</div>
+
+    <div id="status" class="status">请先在浏览器中登录学校教务系统，并打开“我的课表”页面。</div>
+
+    <button id="scanButton" class="secondary">① 读取当前页面并预览</button>
+    <section id="preview" class="preview hidden">
+      <div class="preview-heading"><strong>识别结果</strong><span id="count">0 条</span></div>
+      <div id="courseList" class="course-list"></div>
+      <button id="syncButton" class="primary" disabled>② 同步到我的课表网站</button>
+    </section>
+
+    <a href="http://localhost:5173/" target="_blank" rel="noreferrer">打开 CampusTimetable 网页 ↗</a>
+    <small class="footer">如果识别不到课程，请确认当前页面是完整课表，而不是统一认证登录页或菜单页。</small>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

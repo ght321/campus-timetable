@@ -1,34 +1,16 @@
-
 :root {
-    font-family: Inter, "Microsoft YaHei", "PingFang SC", sans-serif;
-    color: #24314a;
-    background: #f6f8fc;
-    font-synthesis: none;
-    text-rendering: optimizeLegibility;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
+  font-family: Inter, "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  color: #24314a;
+  background: #f6f8fc;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-* {
-    box-sizing: border-box;
-}
-
-html {
-    min-width: 320px;
-    min-height: 100%;
-}
-
-body {
-    min-width: 320px;
-    min-height: 100vh;
-    margin: 0;
-}
-
-button {
-    font-family: inherit;
-}
-
-::selection {
-    color: #283c92;
-    background: #dce4ff;
-}
+* { box-sizing: border-box; }
+html { min-width: 320px; min-height: 100%; }
+body { min-width: 320px; min-height: 100vh; margin: 0; }
+button { font: inherit; }
+button:focus-visible, a:focus-visible { outline: 3px solid #91a7ff; outline-offset: 2px; }
+::selection { color: #283c92; background: #dce4ff; }
