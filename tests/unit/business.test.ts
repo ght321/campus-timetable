@@ -9,6 +9,22 @@ import {
 } from "../../src/utils/date";
 import { occurs, conflicts, courseLayout } from "../../src/utils/timetable";
 import type { Course } from "../../src/models";
+import {
+  validateCourse,
+  validateData,
+  validateSemester,
+} from "../../src/utils/validation";
+import {
+  saveCourse,
+  deleteCourse,
+  changeSemester,
+} from "../../src/features/courses/service";
+import {
+  loadData,
+  saveData,
+  STORAGE_KEY,
+  type StoragePort,
+} from "../../src/services/storage";
 const data = demoData(),
   base = data.courses[0];
 const course = (patch: Partial<Course> = {}): Course => ({ ...base, ...patch });
@@ -97,4 +113,155 @@ describe("conflicts and visual placement", () => {
     expect(layout.get("b")).toEqual({ lane: 1, lanes: 2 });
     expect(layout.get("c")).toEqual({ lane: 0, lanes: 1 });
   });
+});
+describe("validation and CRUD", () => {
+  it("adds, edits, deletes without mutating inputs", () => {
+    const next = saveCourse(data, course({ id: "new", day: 7 }), "add");
+    expect(next.courses).toHaveLength(9);
+    const edited = saveCourse(
+      next,
+      course({ id: "new", day: 7, name: "修改课程" }),
+      "edit",
+    );
+    expect(edited.courses.find((c) => c.id === "new")?.name).toBe("修改课程");
+    expect(deleteCourse(edited, "new").courses).toHaveLength(8);
+    expect(data.courses).toHaveLength(8);
+  });
+  it("requires explicit conflict permission", () => {
+    expect(() => saveCourse(data, course({ id: "new" }), "add")).toThrow(
+      "确认",
+    );
+    expect(
+      saveCourse(data, course({ id: "new" }), "add", true).courses,
+    ).toHaveLength(9);
+  });
+  it("rejects duplicate IDs and missing edits or deletes", () => {
+    expect(() => saveCourse(data, base, "add")).toThrow("ID");
+    expect(() => saveCourse(data, course({ id: "missing" }), "edit")).toThrow(
+      "不存在",
+    );
+    expect(() => deleteCourse(data, "missing")).toThrow("不存在");
+  });
+  it.each([
+    { name: " " },
+    { day: 0 },
+    { day: 8 },
+    { start: 0 },
+    { start: 3, end: 2 },
+    { end: 11 },
+    { startWeek: 0 },
+    { endWeek: 21 },
+    { startWeek: 4, endWeek: 3 },
+    { color: "red" },
+    { parity: "weekly" },
+    { start: 1.5 },
+    { teacher: "" },
+    { room: "" },
+  ])("rejects malformed course %j", (patch) =>
+    expect(() =>
+      validateCourse({ ...base, ...patch }, data.semester),
+    ).toThrow(),
+  );
+  it("rejects parity with no actual occurrences", () =>
+    expect(() =>
+      validateCourse(
+        course({ startWeek: 2, endWeek: 2, parity: "odd" }),
+        data.semester,
+      ),
+    ).toThrow("没有实际"));
+  it("prevents shrinking semester past existing courses", () => {
+    expect(() =>
+      changeSemester(data, { ...data.semester, totalWeeks: 8 }),
+    ).toThrow("课程第");
+    expect(() =>
+      changeSemester(data, { ...data.semester, periodsPerDay: 6 }),
+    ).toThrow();
+  });
+  it("allows semester name, date and extension changes", () =>
+    expect(
+      changeSemester(data, { ...data.semester, name: "新学期", totalWeeks: 24 })
+        .semester.totalWeeks,
+    ).toBe(24));
+  it("rejects invalid semester boundaries", () => {
+    expect(() =>
+      validateSemester({ ...data.semester, startDate: "2026-02-30" }),
+    ).toThrow();
+    expect(() =>
+      validateSemester({ ...data.semester, totalWeeks: 0 }),
+    ).toThrow();
+    expect(() =>
+      validateSemester({ ...data.semester, periodsPerDay: 25 }),
+    ).toThrow();
+  });
+  it("rejects oversized lists and duplicate IDs", () => {
+    expect(() => validateData({ ...data, courses: [base, base] })).toThrow(
+      "ID重复",
+    );
+    expect(() =>
+      validateData({ ...data, courses: Array(501).fill(base) }),
+    ).toThrow("500");
+  });
+});
+describe("storage recovery", () => {
+  const storage = (raw: string | null): StoragePort => ({
+    getItem: () => raw,
+    setItem: (_key, value) => {
+      raw = value;
+    },
+  });
+  it("initializes examples only when key is absent", () =>
+    expect(loadData(storage(null))).toEqual({
+      data,
+      warning: "",
+      writable: true,
+    }));
+  it("preserves a valid empty timetable", () =>
+    expect(
+      loadData(storage(JSON.stringify({ ...data, courses: [] }))).data.courses,
+    ).toEqual([]));
+  it.each([
+    "broken",
+    "null",
+    '{"schemaVersion":99}',
+    JSON.stringify({ ...data, courses: [{ ...base, day: 9 }] }),
+  ])("recovers malformed storage without overwriting it", (raw) => {
+    let written = false;
+    const result = loadData({
+      getItem: () => raw,
+      setItem: () => {
+        written = true;
+      },
+    });
+    expect(result.data).toEqual(data);
+    expect(result.writable).toBe(false);
+    expect(result.warning).not.toBe("");
+    expect(written).toBe(false);
+  });
+  it("handles denied storage reads", () =>
+    expect(
+      loadData({
+        getItem: () => {
+          throw new Error("denied");
+        },
+        setItem: () => {},
+      }).writable,
+    ).toBe(false));
+  it("writes and restores valid changes", () => {
+    const s = storage(null);
+    saveData(s, { ...data, courses: [] });
+    expect(loadData(s).data.courses).toEqual([]);
+    expect(STORAGE_KEY).toBe("campus-timetable:v1");
+  });
+  it("reports quota failure", () =>
+    expect(() =>
+      saveData(
+        {
+          getItem: () => null,
+          setItem: () => {
+            throw new Error("quota");
+          },
+        },
+        data,
+      ),
+    ).toThrow("本地保存失败"));
 });
