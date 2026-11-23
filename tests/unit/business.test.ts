@@ -25,6 +25,7 @@ import {
   STORAGE_KEY,
   type StoragePort,
 } from "../../src/services/storage";
+import { statistics } from "../../src/features/statistics/calculate";
 const data = demoData(),
   base = data.courses[0];
 const course = (patch: Partial<Course> = {}): Course => ({ ...base, ...patch });
@@ -264,4 +265,26 @@ describe("storage recovery", () => {
         data,
       ),
     ).toThrow("本地保存失败"));
+});
+describe("statistics", () => {
+  it("computes counts, hours, days, busiest ties, and semester total", () => {
+    expect(statistics(data.courses, 7)).toEqual({
+      count: 8,
+      hours: 16,
+      days: 5,
+      busiest: [1, 2, 5],
+      total: 8,
+    });
+    expect(statistics(data.courses, 17)).toEqual({
+      count: 0,
+      hours: 0,
+      days: 0,
+      busiest: [],
+      total: 8,
+    });
+  });
+  it("uses parity and counts simultaneous courses as separate hours", () =>
+    expect(
+      statistics([course({ parity: "odd" }), course({ id: "2" })], 2).hours,
+    ).toBe(2));
 });

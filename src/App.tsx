@@ -6,8 +6,13 @@ import { useTimetable } from "./hooks/useTimetable";
 import { useToday } from "./hooks/useToday";
 import { teachingWeek, visibleWeek } from "./utils/date";
 import { createCourseId } from "./utils/id";
-import { saveCourse, deleteCourse } from "./features/courses/service";
-import { occurs } from "./utils/timetable";
+import {
+  saveCourse,
+  deleteCourse,
+  changeSemester,
+} from "./features/courses/service";
+import { Statistics } from "./features/statistics/Statistics";
+import { SemesterForm } from "./features/semester/SemesterForm";
 import { Timetable } from "./components/Timetable/Timetable";
 import { CourseList } from "./components/Course/CourseList";
 import { CourseDetail } from "./components/Course/CourseDetail";
@@ -21,8 +26,8 @@ function App() {
   );
   const week = Math.min(requestedWeek, data.semester.totalWeeks);
   const [selected, setSelected] = useState<Course | null>(null),
-    [editing, setEditing] = useState<Course | null>(null);
-  const active = data.courses.filter((c) => occurs(c, week));
+    [editing, setEditing] = useState<Course | null>(null),
+    [settings, setSettings] = useState(false);
   const current = teachingWeek(data.semester, today);
   const currentLabel =
     current < 1
@@ -56,6 +61,7 @@ function App() {
           </div>
         </div>
         <div className="header-right">
+          <button onClick={() => setSettings(true)}>学期设置</button>
           <button className="primary-button" onClick={() => downloadData(data)}>
             导出课表
           </button>
@@ -101,18 +107,7 @@ function App() {
             今天不在教学周范围内。“回到本周”显示最近的学期边界周。
           </p>
         )}
-        <section className="stats">
-          {[
-            ["本周课程", active.length],
-            ["上课节数", active.reduce((n, c) => n + c.end - c.start + 1, 0)],
-            ["上课天数", new Set(active.map((c) => c.day)).size],
-          ].map(([label, value]) => (
-            <article className="stat-card" key={label}>
-              <span>{label}</span>
-              <strong>{value}</strong>
-            </article>
-          ))}
-        </section>
+        <Statistics courses={data.courses} week={week} />
         <Timetable
           courses={data.courses}
           semester={data.semester}
@@ -166,6 +161,17 @@ function App() {
               ),
             );
             setEditing(null);
+          }}
+        />
+      )}
+      {settings && (
+        <SemesterForm
+          initial={data.semester}
+          onClose={() => setSettings(false)}
+          onSave={(semester) => {
+            commit(changeSemester(data, semester));
+            setWeek(visibleWeek(semester, today));
+            setSettings(false);
           }}
         />
       )}
