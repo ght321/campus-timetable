@@ -1,0 +1,17 @@
+{
+  "school": "南京理工大学",
+  "week": 7,
+  "courses": [
+    {
+      "id": 1,
+      "name": "高等数学",
+      "teacher": "张老师",
+      "room": "教 2-101",
+      "day": 1,
+      "start": 1,
+      "end": 2,
+      "weeks": "1-16周",
+      "color": "blue"
+    }
+  ]
+}

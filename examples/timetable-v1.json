@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "semester": {
+    "name": "2026 秋季学期",
+    "startDate": "2026-09-07",
+    "totalWeeks": 20,
+    "periodsPerDay": 10
+  },
+  "courses": [
+    {
+      "id": "example-1",
+      "name": "软件工程",
+      "teacher": "张老师",
+      "room": "教学楼101",
+      "day": 1,
+      "start": 1,
+      "end": 2,
+      "startWeek": 1,
+      "endWeek": 16,
+      "parity": "all",
+      "color": "blue"
+    }
+  ]
+}
