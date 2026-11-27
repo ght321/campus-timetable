@@ -12,7 +12,7 @@ export function loadData(storage: StoragePort): LoadResult {
   try {
     const raw = storage.getItem(STORAGE_KEY);
     return {
-      data: raw === null ? demoData() : validateData(JSON.parse(raw)),
+      data: raw === null ? { ...demoData(), courses: [] } : validateData(JSON.parse(raw)),
       warning: "",
       writable: true,
     };

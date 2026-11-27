@@ -1,7 +1,7 @@
 import { useState } from "react";
+import { RealSyncPanel } from "./features/sync/RealSyncPanel";
 import "./App.css";
 import type { Course } from "./models";
-import { demoData } from "./data/demo";
 import { useTimetable } from "./hooks/useTimetable";
 import { useToday } from "./hooks/useToday";
 import { teachingWeek, visibleWeek } from "./utils/date";
@@ -59,24 +59,34 @@ function App() {
           <button className="primary-button" onClick={() => downloadData(data)}>
             导出课表
           </button>
-          <button
-            onClick={() => {
-              if (
-                window.confirm(
-                  "恢复演示数据将替换全部课程及学期设置，是否继续？",
-                )
-              ) {
-                const demo = demoData();
-                commit(demo, true);
-                setWeek(visibleWeek(demo.semester, today));
-              }
-            }}
-          >
-            恢复演示数据
-          </button>
+
         </div>
       </header>
       <main className="container">
+        <RealSyncPanel
+          semester={data.semester}
+          existingCourseCount={data.courses.length}
+          onImport={(courses) => {
+            // Expand the semester's visible daily period count to fit imported classes.
+            // Keep the previous setting when it is already larger; cap at model limit 24.
+            const importedMaxPeriod = courses.reduce(
+              (max, course) => Math.max(max, course.end),
+              data.semester.periodsPerDay,
+            );
+            const nextSemester = {
+              ...data.semester,
+              periodsPerDay: Math.min(24, importedMaxPeriod),
+            };
+            // Replace the entire course array and updated semester in one validated write.
+            // Persist first; update the visible React state only after storage succeeds.
+            const saved = commit({ ...data, semester: nextSemester, courses }, true);
+            if (!saved) return false;
+            setWeek(visibleWeek(nextSemester, today));
+            setSelected(null);
+            setEditing(null);
+            return true;
+          }}
+        />
         <section className="welcome">
           <div>
             <p className="eyebrow">YOUR CAMPUS, YOUR SCHEDULE</p>

@@ -7,21 +7,26 @@ export function useTimetable() {
   const [data, setData] = useState(loaded.data);
   const [storageMessage, setStorageMessage] = useState(loaded.warning);
   const [writable, setWritable] = useState(loaded.writable);
-  function commit(next: TimetableData, reset = false) {
+  function commit(next: TimetableData, reset = false): boolean {
     const valid = validateData(next);
-    setData(valid);
     if (!writable && !reset) {
+      setData(valid);
       setStorageMessage(
-        "本地数据尚未重置，修改仅保留在当前页面。请导出备份或恢复演示数据后继续。",
+        "本地数据尚未重置，修改仅保留在当前页面。请先导出备份或恢复演示数据后继续。",
       );
-      return;
+      return false;
     }
     try {
+      // Persist the complete validated snapshot before updating React state.
+      // A failed write therefore leaves the previous timetable intact.
       browserSave(valid);
+      setData(valid);
       setWritable(true);
-      setStorageMessage("已自动保存到本机浏览器");
+      setStorageMessage("已整体保存到浏览器本地存储");
+      return true;
     } catch (error) {
-      setStorageMessage(error instanceof Error ? error.message : "保存失败");
+      setStorageMessage(error instanceof Error ? error.message : "本地保存失败");
+      return false;
     }
   }
   return { data, commit, storageMessage };
