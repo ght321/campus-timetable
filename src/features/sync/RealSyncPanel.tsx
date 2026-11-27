@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Course, Semester } from "../../models";
+import type { Course, Exam, Semester } from "../../models";
 import { convertLegacyCourses, type LegacyTimetable } from "./adapter";
 import "./RealSyncPanel.css";
 
@@ -9,6 +9,7 @@ type ApiPayload = {
   message?: string;
   captchaDataUrl?: string;
   count?: number;
+  lastSyncedAt?: string | null;
   [key: string]: unknown;
 };
 
@@ -18,6 +19,16 @@ type HealthPayload = {
   port?: number;
 };
 
+type ExamApiPayload = {
+  exams?: Exam[];
+  lastSyncedAt?: string | null;
+};
+
+type ExamCache = {
+  exams: Exam[];
+  lastSyncedAt: string | null;
+};
+
 type Props = {
   semester: Semester;
   existingCourseCount: number;
@@ -25,6 +36,7 @@ type Props = {
 };
 
 const API_BASE = "http://127.0.0.1:3001";
+const EXAM_CACHE_KEY = "campus-exams:v1";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -64,6 +76,58 @@ function phaseText(phase: string): string {
   return "未登录";
 }
 
+function readLocalExamCache(): ExamCache {
+  try {
+    const raw = window.localStorage.getItem(EXAM_CACHE_KEY);
+    if (!raw) return { exams: [], lastSyncedAt: null };
+    const parsed = JSON.parse(raw) as Partial<ExamCache>;
+    return {
+      exams: Array.isArray(parsed.exams) ? parsed.exams : [],
+      lastSyncedAt: parsed.lastSyncedAt || null,
+    };
+  } catch {
+    return { exams: [], lastSyncedAt: null };
+  }
+}
+
+/**
+ * Refresh the school's exam list once, after the timetable has been imported.
+ * Manual exams are kept; the previous school list is replaced only when the
+ * server returns a non-empty, successfully parsed list.
+ */
+async function syncSchoolExams(): Promise<number> {
+  const result = await api<ApiPayload>("/api/auth/exams", { method: "POST" });
+  if (!result.ok) {
+    throw new Error(String(result.message || "学校考试安排读取失败；原有考试缓存已保留。"));
+  }
+
+  const saved = await api<ExamApiPayload>("/api/exams");
+  const schoolExams = Array.isArray(saved.exams)
+    ? saved.exams
+      .filter((exam) => Boolean(exam && exam.name))
+      .map((exam) => ({ ...exam, source: "school" as const }))
+    : [];
+
+  if (schoolExams.length === 0) {
+    throw new Error("考试查询已完成，但本机服务没有返回可保存的考试记录；原有考试缓存已保留。");
+  }
+
+  const previous = readLocalExamCache();
+  const manualExams = previous.exams.filter((exam) => exam.source === "manual");
+  const nextCache: ExamCache = {
+    exams: [...manualExams, ...schoolExams],
+    lastSyncedAt: saved.lastSyncedAt || result.lastSyncedAt || new Date().toISOString(),
+  };
+
+  try {
+    window.localStorage.setItem(EXAM_CACHE_KEY, JSON.stringify(nextCache));
+  } catch {
+    throw new Error("学校已读取到考试安排，但考试缓存无法写入当前浏览器。请检查本地存储空间；原有考试缓存未主动清除。");
+  }
+
+  return schoolExams.length;
+}
+
 export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props) {
   const [serverOnline, setServerOnline] = useState(false);
   const [phase, setPhase] = useState("checking");
@@ -74,6 +138,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
   const [captchaDataUrl, setCaptchaDataUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [lastSyncedCount, setLastSyncedCount] = useState<number | null>(null);
+  const [lastExamSyncedCount, setLastExamSyncedCount] = useState<number | null>(null);
   const [schoolSemester, setSchoolSemester] = useState("");
 
   useEffect(() => {
@@ -87,7 +152,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
         if (!active) return;
         setPhase(String(status.phase || "idle"));
         setMessage(status.phase === "connected"
-          ? "本机同步服务已获取教务系统课表，但尚未导入当前浏览器。请点击“导入已获取课表（整体替换）”完成替换。"
+          ? "学校认证会话已连接。点击“同步课表和考试”，即可一次更新两类数据。"
           : String(status.message || "同步服务已连接。"));
         setCaptchaDataUrl(String(status.captchaDataUrl || ""));
       } catch (error) {
@@ -109,7 +174,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
     return status;
   }
 
-  async function importLatestTimetable() {
+  async function importLatestTimetable(syncExamsAfterImport = false): Promise<boolean> {
     const timetable = await api<LegacyTimetable>("/api/timetable");
     const oldCourses = Array.isArray(timetable.courses) ? timetable.courses : [];
     const courses = convertLegacyCourses(oldCourses, semester);
@@ -122,18 +187,37 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
       : "";
     const replaceMessage =
       "即将导入 " + courses.length + " 条课程时段，并替换当前全部 " + existingCourseCount + " 条课程安排。" +
+      (syncExamsAfterImport ? "\n本次还会自动同步学校考试安排，不需要再进入考试页查询。" : "") +
       "\n\n学期：" + (returnedSemester || semester.name) + warning + "\n\n是否继续？";
     if (!window.confirm(replaceMessage)) {
-      setMessage("已取消导入，现有课表没有改变。");
-      return;
+      setMessage("已取消导入，现有课表和考试缓存均未改变。");
+      return false;
     }
 
     const saved = onImport(courses);
     if (!saved) {
       throw new Error("新课表没有成功写入浏览器本地存储，原课表未被替换。请检查页面上方的本地存储状态后重试。");
     }
+
     setLastSyncedCount(courses.length);
-    setMessage("同步完成：已整体替换原有 " + existingCourseCount + " 条课程安排，保存新课表 " + courses.length + " 条课程时段。" + warning);
+    if (!syncExamsAfterImport) {
+      setMessage("课表导入完成：保存 " + courses.length + " 条课程时段。此操作只导入已缓存课表，没有重新查询学校考试。");
+      return true;
+    }
+
+    setMessage("课表已更新（" + courses.length + " 条课程时段），正在使用同一登录会话同步考试安排……");
+    try {
+      const examCount = await syncSchoolExams();
+      setLastExamSyncedCount(examCount);
+      setMessage(
+        "同步完成：课表 " + courses.length + " 条，考试 " + examCount + " 场。考试记录已保存到本机，打开“考试”页面即可查看，无需再次查询。" + warning,
+      );
+    } catch (error) {
+      setMessage(
+        "课表已同步 " + courses.length + " 条；但考试同步未完成：" + errorText(error) + "\n再次点击“同步课表和考试”可一并重试，已有考试缓存会保留。" + warning,
+      );
+    }
+    return true;
   }
 
   async function login() {
@@ -155,7 +239,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
       setMessage(String(result.message || "登录流程已返回。"));
       if (currentPhase === "connected") {
         setPassword("");
-        await importLatestTimetable();
+        await importLatestTimetable(true);
       } else if (currentPhase !== "needs_captcha") {
         await refreshStatus().catch(() => undefined);
       }
@@ -186,7 +270,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
       if (currentPhase === "connected") {
         setPassword("");
         setCaptcha("");
-        await importLatestTimetable();
+        await importLatestTimetable(true);
       }
     } catch (error) {
       setMessage(errorText(error));
@@ -199,7 +283,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
     setBusy(true);
     setMessage("正在导入服务端已获取的课表；确认后将整体替换当前浏览器课表……");
     try {
-      await importLatestTimetable();
+      await importLatestTimetable(false);
     } catch (error) {
       setMessage(errorText(error));
     } finally {
@@ -209,11 +293,11 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
 
   async function syncAgain() {
     setBusy(true);
-    setMessage("正在使用当前认证会话重新读取课表……");
+    setMessage("正在使用当前认证会话同步课表和考试安排……");
     try {
       const result = await api<ApiPayload>("/api/auth/scan", { method: "POST" });
       if (!result.ok) throw new Error(String(result.message || "教务系统课表抓取失败。"));
-      await importLatestTimetable();
+      await importLatestTimetable(true);
     } catch (error) {
       setMessage(errorText(error));
       await refreshStatus().catch(() => undefined);
@@ -244,7 +328,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
         <div>
           <p className="real-sync-eyebrow">REAL ACADEMIC SYNC</p>
           <h2 id="real-sync-heading">教务系统真实同步</h2>
-          <p>通过本机 Edge 登录学校教务系统，将真实课程导入当前课表。</p>
+          <p>登录一次即可同步真实课表和考试安排；考试记录会自动保存在本机。</p>
         </div>
         <div className={"real-sync-status " + (serverOnline ? "is-online" : "is-offline")}>
           <span className="real-sync-dot" />
@@ -255,7 +339,8 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
       <div className="real-sync-meta">
         <span>认证状态：{phaseText(phase)}</span>
         <span>当前课程：{existingCourseCount} 条</span>
-        {lastSyncedCount !== null && <span>最近导入：{lastSyncedCount} 条</span>}
+        {lastSyncedCount !== null && <span>本次课程：{lastSyncedCount} 条</span>}
+        {lastExamSyncedCount !== null && <span>本次考试：{lastExamSyncedCount} 场</span>}
         {schoolSemester && <span>学校学期：{schoolSemester}</span>}
       </div>
 
@@ -299,7 +384,7 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
             />
           </label>
           <button type="button" onClick={submitCaptcha} disabled={busy || !serverOnline}>
-            提交验证码
+            提交验证码并同步课表和考试
           </button>
         </div>
       )}
@@ -307,16 +392,16 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
       <div className="real-sync-actions">
         {phase !== "connected" && phase !== "needs_captcha" && (
           <button type="button" className="real-sync-primary" onClick={login} disabled={busy || !serverOnline}>
-            {busy ? "请稍候……" : "登录并获取课表"}
+            {busy ? "请稍候……" : "登录并同步课表和考试"}
           </button>
         )}
         {phase === "connected" && (
           <>
             <button type="button" className="real-sync-primary" onClick={syncAgain} disabled={busy}>
-              {busy ? "正在同步……" : "同步最新课表"}
+              {busy ? "正在同步课表和考试……" : "同步课表和考试"}
             </button>
             <button type="button" onClick={importSavedTimetable} disabled={busy}>
-              导入已获取课表（整体替换）
+              仅导入已缓存课表
             </button>
             <button type="button" onClick={closeSession} disabled={busy}>关闭登录会话</button>
           </>
@@ -326,9 +411,9 @@ export function RealSyncPanel({ semester, existingCourseCount, onImport }: Props
         </button>
       </div>
 
-      <p className="real-sync-message" role="status">{message}</p>
+      <p className="real-sync-message" role="status" aria-live="polite">{message}</p>
       <p className="real-sync-note">
-        安全提示：账号和密码只发送到本机同步服务；服务端在进程内处理登录，不写入课表文件。请勿在公共或不可信网络环境使用学校认证。
+        同步说明：一次“同步课表和考试”会先更新课表，再使用同一登录会话读取考试并写入本地缓存。打开考试页只展示缓存，不会再次访问学校查询。账号和密码仅用于本次登录，不写入课表文件。
       </p>
     </section>
   );

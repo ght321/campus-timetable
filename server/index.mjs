@@ -3,12 +3,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseNjustLoginForm, parseNjustTimetableHtml } from './njust-parser.mjs';
+import { parseNjustExamHtml } from './njust-exam-parser.mjs';
 import { chromium } from 'playwright-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
 const dataDir = path.join(projectRoot, 'data');
 const dataFile = path.join(dataDir, 'timetable.json');
+const examDataFile = path.join(dataDir, 'exams.json');
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.TIMETABLE_PORT || 3001);
 const MAX_BODY = 256 * 1024;
@@ -31,6 +33,7 @@ const SCHOOL_FLOW = [
 const AUTO_REFRESH_MS = 10 * 60 * 1000;
 
 const emptyTimetable = () => ({ school: '南京理工大学', semester: '', source: '', sourceUrl: '', lastSyncedAt: null, courses: [] });
+const emptyExamData = () => ({ school: '南京理工大学', source: '', sourceUrl: '', lastSyncedAt: null, exams: [] });
 const authState = {
   phase: 'idle', message: '请输入校园账号和密码。', startedAt: null, lastDetectedAt: null,
   error: '', jar: null, targetUrl: TARGET_URLS[0], pending: null, captchaDataUrl: '', lastScanAt: 0,
@@ -64,6 +67,24 @@ function assertSafeUrl(value, label = '目标地址', options = {}) {
   if (isAllowedLegacySsoGet(url, options.method || 'GET', options.allowLegacySsoGet)) return url;
   throw new Error(`${label}必须是南京理工大学域名下的 HTTPS 地址。仅在官方 SSO 交接时允许读取 bkjw.njust.edu.cn/njlgdx/ 的 HTTP 页面，绝不通过 HTTP 提交账号或密码。`);
 }
+function normalizeExam(exam, index) {
+  const name = String(exam?.name || '').trim().slice(0, 160);
+  if (!name) return null;
+  const source = exam?.source === 'manual' ? 'manual' : 'school';
+  return {
+    id: String(exam?.id || `exam-${index + 1}`).slice(0, 220),
+    name,
+    date: String(exam?.date || '日期待公布').trim().slice(0, 40),
+    time: String(exam?.time || '时间待公布').trim().slice(0, 80),
+    room: String(exam?.room || '暂未安排').trim().slice(0, 160),
+    seatNumber: String(exam?.seatNumber || '暂未安排').trim().slice(0, 80),
+    examNumber: String(exam?.examNumber || '').trim().slice(0, 80),
+    courseCode: String(exam?.courseCode || '').trim().slice(0, 80),
+    level: String(exam?.level || (source === 'school' ? '学校考试安排' : '手动添加')).trim().slice(0, 80),
+    invigilator: String(exam?.invigilator || '').trim().slice(0, 120),
+    source,
+  };
+}
 function normalizeCourse(course, index) {
   const name = String(course?.name || course?.courseName || '').trim().slice(0, 160);
   const day = Number(course?.day), start = Number(course?.start), end = Number(course?.end);
@@ -93,13 +114,30 @@ async function writeTimetable(data) {
   await fs.writeFile(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
   await fs.rename(tempFile, dataFile);
 }
+async function readExamData() {
+  try {
+    const raw = await fs.readFile(examDataFile, 'utf8');
+    const data = JSON.parse(raw);
+    return { ...emptyExamData(), ...data, exams: Array.isArray(data.exams) ? data.exams.map(normalizeExam).filter(Boolean) : [] };
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('读取本机考试缓存失败：', error?.message || 'unknown error');
+    return emptyExamData();
+  }
+}
+async function writeExamData(data) {
+  await fs.mkdir(dataDir, { recursive: true });
+  const tempFile = `${examDataFile}.tmp`;
+  await fs.writeFile(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(tempFile, examDataFile);
+}
+
 function setCors(req, res) {
   const origin = req.headers.origin || '';
   const isLocalWeb = /^http:\/\/(localhost|127\.0\.0\.1):5\d{3}$/.test(origin);
   if (!origin || isLocalWeb) {
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   }
 }
@@ -1079,6 +1117,462 @@ async function scanTimetable(force = false) {
   }
 }
 
+// Exam flow follows the Android WebView sequence: main page -> query page -> native query button.
+
+async function inspectExamResultPage(page) {
+  try {
+    return await page.evaluate(() => {
+      const tidy = (value) => String(value || '').replace(/[\\s\\u00a0\\u3000]+/g, ' ').trim().slice(0, 80);
+      const tables = Array.from(document.querySelectorAll('table')).slice(0, 12).map((table) => {
+        const rows = Array.from(table.querySelectorAll('tr'));
+        return {
+          id: table.id || '',
+          className: typeof table.className === 'string' ? table.className.slice(0, 100) : '',
+          rowCount: rows.length,
+          header: rows[0] ? Array.from(rows[0].querySelectorAll('th,td')).map((cell) => tidy(cell.innerText || cell.textContent)).slice(0, 10) : [],
+          dataCellCounts: rows.slice(1, 6).map((row) => row.querySelectorAll('td').length),
+        };
+      });
+      const forms = Array.from(document.forms).slice(0, 8).map((form) => {
+        let actionPath = '';
+        try { actionPath = new URL(form.getAttribute('action') || location.href, location.href).pathname; } catch { /* keep path empty */ }
+        return {
+          id: form.id || '', actionPath,
+          method: String(form.getAttribute('method') || 'GET').toUpperCase(),
+          fields: Array.from(form.querySelectorAll('input,select,textarea')).slice(0, 24).map((field) => ({
+            tag: field.tagName.toLowerCase(), type: field.getAttribute('type') || '',
+            name: field.getAttribute('name') || '', id: field.id || '',
+          })),
+        };
+      });
+      return {
+        page: location.pathname,
+        title: document.title || '',
+        readyState: document.readyState,
+        dataListPresent: Boolean(document.querySelector('#dataList')),
+        bodyTextLength: document.body?.innerText?.length || 0,
+        tables,
+        forms,
+      };
+    });
+  } catch (error) {
+    return { page: safeLocation(page.url()), error: String(error?.message || '读取考试结果页结构失败').slice(0, 160) };
+  }
+}
+
+async function scanExams() {
+  // NJUST_EXAM_TEMP_DIAGNOSTICS
+  // Logs safe request metadata and response table shape only.
+  // Never logs cookies, query strings, credentials, hidden-field values or exam-row contents.
+  const __njustExamDiagPage = authState.page;
+  if (__njustExamDiagPage && authState.__njustExamDiagPage !== __njustExamDiagPage) {
+    authState.__njustExamDiagPage = __njustExamDiagPage;
+    const __njustSafeExamMeta = (rawUrl) => {
+      try {
+        const u = new URL(rawUrl);
+        if (!(u.hostname === 'bkjw.njust.edu.cn' || u.hostname.endsWith('.njust.edu.cn'))) return null;
+        if (!/^\/njlgdx\/xsks\//i.test(u.pathname)) return null;
+        return { path: u.pathname };
+      } catch { return null; }
+    };
+    const __njustSafeTerm = (rawValue) => {
+      const value = String(rawValue == null ? '' : rawValue).trim().slice(0, 60);
+      if (!value) return '';
+      if (/^(?:20\d{2}[-_/.]?20\d{2}(?:[-_/.][12])?|20\d{2}[-_/.][12])$/.test(value)) return value;
+      return '[nonstandard-value-length:' + value.length + ']';
+    };
+    const __njustDiagLog = (kind, data) => {
+      try {
+        console.log('[NJUST_EXAM_DIAG]', JSON.stringify({ kind, at: new Date().toISOString(), ...data }));
+      } catch { /* diagnostics must never interrupt the real school flow */ }
+    };
+
+    __njustExamDiagPage.on('request', (request) => {
+      const meta = __njustSafeExamMeta(request.url());
+      if (!meta) return;
+      const rawBody = request.postData() || '';
+      const postKeys = [];
+      const termFields = [];
+      try {
+        if (rawBody.trim().startsWith('{')) {
+          const parsed = JSON.parse(rawBody);
+          for (const [key, value] of Object.entries(parsed || {})) {
+            postKeys.push(key);
+            if (/^(xnxqid|xnxq01id|xnxq|semester|term|xn|xq)$/i.test(key)) {
+              termFields.push({ key, value: __njustSafeTerm(value) });
+            }
+          }
+        } else if (rawBody) {
+          const params = new URLSearchParams(rawBody);
+          for (const [key, value] of params.entries()) {
+            postKeys.push(key);
+            if (/^(xnxqid|xnxq01id|xnxq|semester|term|xn|xq)$/i.test(key)) {
+              termFields.push({ key, value: __njustSafeTerm(value) });
+            }
+          }
+        }
+      } catch { /* omit unparseable body details */ }
+      __njustDiagLog('request', {
+        method: request.method(), path: meta.path, resourceType: request.resourceType(),
+        postLength: rawBody.length, postKeys: [...new Set(postKeys)].slice(0, 40),
+        termFields: termFields.slice(0, 8)
+      });
+    });
+
+    __njustExamDiagPage.on('response', async (response) => {
+      const meta = __njustSafeExamMeta(response.url());
+      if (!meta) return;
+      let contentType = '';
+      let bodyLength = 0;
+      let tableRows = null;
+      let tdCounts = [];
+      let header = [];
+      try {
+        const headers = await response.allHeaders();
+        contentType = String(headers['content-type'] || '');
+        if (/text\/html|application\/json|text\/plain/i.test(contentType)) {
+          const body = await response.text();
+          bodyLength = body.length;
+          const table = body.match(/<table\b(?=[^>]*\bid\s*=\s*["']dataList["'])[^>]*>([\s\S]*?)<\/table\s*>/i);
+          if (table) {
+            const rows = [...table[1].matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)];
+            tableRows = rows.length;
+            tdCounts = rows.slice(0, 5).map((row) => (row[1].match(/<t[dh]\b/gi) || []).length);
+            if (rows.length) {
+              header = [...rows[0][1].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]\s*>/gi)]
+                .map((cell) => cell[1].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim())
+                .slice(0, 10);
+            }
+          }
+        }
+      } catch { /* response may be unavailable or already disposed */ }
+      __njustDiagLog('response', {
+        method: response.request().method(), path: meta.path,
+        status: response.status(), contentType, bodyLength, tableRows, tdCounts, header
+      });
+    });
+
+    __njustExamDiagPage.on('requestfailed', (request) => {
+      const meta = __njustSafeExamMeta(request.url());
+      if (!meta) return;
+      __njustDiagLog('requestfailed', {
+        method: request.method(), path: meta.path,
+        failure: String(request.failure()?.errorText || 'unknown').slice(0, 120)
+      });
+    });
+
+    __njustExamDiagPage.on('framenavigated', (frame) => {
+      const meta = __njustSafeExamMeta(frame.url());
+      if (!meta) return;
+      __njustDiagLog('frame-navigation', meta);
+      if (/xsksap_query$/i.test(meta.path)) {
+        void (async () => {
+          await frame.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+          const info = await frame.evaluate(() => {
+            const form = document.getElementById('ksapQueryForm');
+            const term = document.getElementById('xnxqid');
+            const button = document.getElementById('btn_query');
+            const actionPath = form ? (() => { try { return new URL(form.getAttribute('action') || location.href, location.href).pathname; } catch { return ''; } })() : '';
+            return {
+              title: document.title,
+              formFound: !!form,
+              method: form ? String(form.method || 'GET').toUpperCase() : '',
+              actionPath,
+              target: form ? String(form.target || '') : '',
+              formElementCount: form?.elements?.length || 0,
+              termFound: !!term,
+              termName: term?.name || '',
+              termValue: term ? String(term.value || '').slice(0, 60) : '',
+              termText: term && term.selectedIndex >= 0 ? String(term.options[term.selectedIndex]?.text || '').trim().slice(0, 60) : '',
+              termOptionCount: term?.options?.length || 0,
+              queryButtonFound: !!button,
+              queryButtonDisabled: button ? !!button.disabled : null,
+              queryButtonText: button ? String(button.innerText || button.textContent || button.value || '').trim().slice(0, 40) : '',
+              controls: form ? [...form.elements].slice(0, 40).map((element) => ({
+                name: element.name || '', type: String(element.type || element.tagName || '').toLowerCase(),
+                disabled: !!element.disabled, checked: 'checked' in element ? !!element.checked : null
+              })) : []
+            };
+          }).catch((error) => ({ evaluateError: String(error?.message || error).slice(0, 120) }));
+          __njustDiagLog('query-form', info);
+        })().catch(() => {});
+      }
+    });
+    __njustDiagLog('installed', { pageUrlPath: (() => { try { return new URL(__njustExamDiagPage.url()).pathname; } catch { return ''; } })() });
+  }
+
+  const page = authState.page;
+  const context = authState.context;
+  if (!page || !context || !authState.browser || authState.phase !== 'connected') {
+    return { ok: false, message: '还没有建立学校认证会话，请先在“个人信息”页面登录并同步课表。' };
+  }
+
+  const EXAM_MAIN_URL = 'https://bkjw.njust.edu.cn/njlgdx/framework/main.jsp';
+  const EXAM_QUERY_PATH = '/njlgdx/xsks/xsksap_query';
+  const EXAM_LIST_PATH = '/njlgdx/xsks/xsksap_list';
+  const framePath = (frame) => {
+    try { return new URL(frame.url()).pathname; } catch { return ''; }
+  };
+  const findExamFrame = () => page.frames().find((frame) =>
+    [EXAM_QUERY_PATH, EXAM_LIST_PATH].includes(framePath(frame))
+  ) || null;
+  const safeFramePath = (frame) => safeLocation(frame.url());
+
+  try {
+    // 与 Android 一致：复用当前已认证会话，先从教务主页进入考试报名。
+    await page.goto(EXAM_MAIN_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(800);
+
+    let entryClicked = false;
+    let entryInfo = null;
+    let examFrame = findExamFrame();
+
+    // Android 会遍历主页面和子 frame；桌面端也逐个检查所有 frame。
+    for (let attempt = 0; attempt < 15 && !examFrame; attempt++) {
+      for (const frame of page.frames()) {
+        if (frame.isDetached()) continue;
+        const result = await frame.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a[href]'));
+          const link = links.find((element) => {
+            try {
+              const target = new URL(element.getAttribute('href'), document.location.href);
+              return target.hostname === 'bkjw.njust.edu.cn'
+                && target.pathname === '/njlgdx/xsks/xsksap_query';
+            } catch { return false; }
+          });
+          if (!link) return null;
+          const info = {
+            clicked: true,
+            text: String(link.innerText || link.textContent || '').trim().slice(0, 80),
+          };
+          link.click();
+          return info;
+        }).catch(() => null);
+
+        if (result?.clicked) {
+          entryClicked = true;
+          entryInfo = result;
+          break;
+        }
+      }
+
+      examFrame = findExamFrame();
+      if (!examFrame) await page.waitForTimeout(500);
+    }
+
+    // 如果点击动作触发了导航，evaluate 回调可能被导航打断；以实际 frame URL 为准。
+    examFrame = findExamFrame();
+    if (!examFrame) {
+      const frameDiagnostics = await Promise.all(page.frames().map(async (frame) => ({
+        page: safeFramePath(frame),
+        title: await frame.title().catch(() => ''),
+      })));
+      return {
+        ok: false,
+        message: entryClicked
+          ? '已点击教务主页的考试报名入口，但没有进入考试查询页面。原有考试缓存已保留。'
+          : '教务主页中未找到考试报名链接。原有考试缓存已保留。',
+        diagnostics: {
+          page: safeLocation(page.url()),
+          title: await page.title().catch(() => ''),
+          entryText: entryInfo?.text || '',
+          frames: frameDiagnostics,
+        },
+      };
+    }
+
+    // Android 在考试查询页 onPageFinished 后等待约 1200 ms，再点击原生查询按钮。
+    let queryActionInfo = null;
+    if (framePath(examFrame) === EXAM_QUERY_PATH) {
+      await page.waitForTimeout(1200);
+      const queryAction = await examFrame.evaluate(() => {
+        const button = document.getElementById('btn_query');
+        const form = document.getElementById('ksapQueryForm');
+        const term = document.getElementById('xnxqid');
+        if (!button) return { ok: false, reason: 'BTN_NOT_FOUND' };
+        if (!form) return { ok: false, reason: 'FORM_NOT_FOUND' };
+        if (button.disabled) return { ok: false, reason: 'BUTTON_DISABLED' };
+
+        const info = {
+          ok: true,
+          semester: term ? String(term.value || '').slice(0, 40) : '',
+          semesterText: term && term.options && term.selectedIndex >= 0 ? String(term.options[term.selectedIndex].text || '').trim().slice(0, 80) : '',
+          semesterOptionCount: term && term.options ? term.options.length : 0,
+          hasOnClick: button.hasAttribute('onclick') || typeof button.onclick === 'function',
+          buttonType: String(button.type || '').toLowerCase(),
+          buttonText: String(button.innerText || button.textContent || button.value || '').trim().slice(0, 40),
+          formElementCount: form.elements ? form.elements.length : 0,
+          method: String(form.method || 'GET').toUpperCase(),
+          actionPath: (() => {
+            try { return new URL(form.getAttribute('action') || document.location.href, document.location.href).pathname; }
+            catch { return ''; }
+          })(),
+        };
+        // 必须触发学校页面自己的 onclick/submit 逻辑，不绕过它自行拼接请求。
+        button.click();
+        return info;
+      }).catch((error) => ({ ok: false, reason: `QUERY_CLICK_ERROR: ${String(error?.message || error).slice(0, 120)}` }));
+      queryActionInfo = queryAction;
+
+      if (!queryAction.ok) {
+        // click() 可能触发同 URL 的 POST/页面重载，导致 evaluate 回调被销毁。
+        // 这种情况下 xsksap_query 本身也是有效结果容器，不能只接受 xsksap_list。
+        if (String(queryAction.reason || '').startsWith('QUERY_CLICK_ERROR')) {
+          await page.waitForTimeout(1500);
+          examFrame = findExamFrame();
+          if (!examFrame) {
+            return {
+              ok: false,
+              message: '点击学校考试查询按钮后页面发生跳转，但没有检测到考试查询结果页面。原有考试缓存已保留。',
+              diagnostics: {
+                page: safeLocation(page.url()),
+                queryButton: queryAction.reason,
+              },
+            };
+          }
+          // 若导航后仍为 xsksap_query，继续轮询该页面的 AJAX/POST 更新结果。
+        } else {
+          examFrame = findExamFrame();
+          if (!examFrame || framePath(examFrame) !== EXAM_LIST_PATH) {
+            return {
+              ok: false,
+              message: `未能执行学校考试查询按钮（${queryAction.reason || 'UNKNOWN'}）。原有考试缓存已保留。`,
+              diagnostics: {
+                page: safeLocation(examFrame?.url() || page.url()),
+                title: examFrame ? await examFrame.title().catch(() => '') : await page.title().catch(() => ''),
+                queryButton: queryAction.reason || 'UNKNOWN',
+              },
+            };
+          }
+        }
+      }
+    }
+
+    // 检查是否跳回统一身份认证页面；考试查询失败不能清空旧缓存。
+    for (const frame of page.frames()) {
+      const url = frame.url();
+      if (isAuthServerUrl(url)) {
+        authState.phase = 'session_expired';
+        authState.message = '教务系统登录会话已失效，请重新登录后查询考试。';
+        return { ok: false, message: authState.message };
+      }
+    }
+
+    // 兼容两种学校行为：跳转 xsksap_list，或仍停留 xsksap_query 并通过 AJAX 更新 DOM。
+    // Android 在点击后约 1 秒开始检查，并每 500 ms 检查一次，最多约 12 秒。
+    await page.waitForTimeout(1000);
+    let selected = null;
+    let parsed = { parser: 'njust-exam-empty', exams: [] };
+    let lastSnapshot = null;
+
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const candidateFrames = page.frames()
+        .filter((frame) => [EXAM_LIST_PATH, EXAM_QUERY_PATH].includes(framePath(frame)))
+        .sort((left, right) => Number(framePath(right) === EXAM_LIST_PATH) - Number(framePath(left) === EXAM_LIST_PATH));
+
+      for (const frame of candidateFrames) {
+        const snapshot = await frame.evaluate(() => {
+          const body = document.body;
+          const dataList = document.querySelector('#dataList');
+          const roots = dataList ? [dataList] : Array.from(document.querySelectorAll('table'));
+          let rowCount = 0;
+          const tables = roots.map((root) => {
+            const rows = Array.from(root.querySelectorAll('tr'));
+            rowCount += rows.filter((row) => row.querySelectorAll('td').length >= 7).length;
+            return {
+              rows: rows.length,
+              header: rows.slice(0, 2).map((row) => String(row.innerText || row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 180)),
+            };
+          });
+          return {
+            html: body ? body.innerHTML : '',
+            title: document.title || '',
+            path: document.location.pathname,
+            bodyCharacters: body ? (body.innerHTML || '').length : 0,
+            tableCount: document.querySelectorAll('table').length,
+            rowCount,
+            tables: tables.slice(0, 8),
+          };
+        }).catch(() => null);
+
+        if (!snapshot) continue;
+        lastSnapshot = snapshot;
+        const frameUrl = frame.url();
+        const candidateParsed = parseNjustExamHtml(snapshot.html, frameUrl);
+        if (candidateParsed.exams.length) {
+          selected = { frame, snapshot, url: frameUrl };
+          parsed = candidateParsed;
+          break;
+        }
+        if (snapshot.bodyCharacters > 0) {
+          selected = { frame, snapshot, url: frameUrl };
+          parsed = candidateParsed;
+        }
+      }
+
+      if (parsed.exams.length) break;
+      await page.waitForTimeout(500);
+    }
+
+    if (!parsed.exams.length) {
+      const diagnostics = {
+        page: selected ? safeLocation(selected.url) : safeLocation(page.url()),
+        title: selected?.snapshot?.title || await page.title().catch(() => ''),
+        parser: parsed.parser,
+        rowCount: lastSnapshot?.rowCount ?? 0,
+        bodyCharacters: lastSnapshot?.bodyCharacters ?? 0,
+        tableCount: lastSnapshot?.tableCount ?? 0,
+        tables: lastSnapshot?.tables ?? [],
+        frames: page.frames().map((frame) => safeFramePath(frame)),
+        queryAction: queryActionInfo,
+      };
+      const currentPath = selected?.snapshot?.path || (() => {
+        try { return new URL(page.url()).pathname; } catch { return ''; }
+      })();
+      const routeMessage = currentPath === EXAM_LIST_PATH
+        ? '已进入 xsksap_list，但暂未识别到考试记录'
+        : currentPath === EXAM_QUERY_PATH
+          ? '已执行查询按钮，但 xsksap_query 页面暂未出现可识别的考试记录'
+          : `考试查询后当前页面路径为 ${currentPath || '未知'}`;
+      return {
+        ok: false,
+        message: `${routeMessage}。原有考试缓存已保留。请检查脱敏诊断中的表格表头和行数。`,
+        diagnostics,
+      };
+    }
+
+    const now = new Date().toISOString();
+    await writeExamData({
+      school: '南京理工大学',
+      source: '南京理工大学学校原生考试查询按钮读取',
+      sourceUrl: safeSchoolUrl(selected.url),
+      lastSyncedAt: now,
+      exams: parsed.exams,
+    });
+
+    return {
+      ok: true,
+      count: parsed.exams.length,
+      lastSyncedAt: now,
+      message: `考试查询成功：通过学校原生查询流程读取到 ${parsed.exams.length} 条考试安排。`,
+      diagnostics: {
+        page: safeLocation(selected.url),
+        parser: parsed.parser,
+        tableCount: selected.snapshot.tableCount,
+        rowCount: selected.snapshot.rowCount,
+      },
+    };
+  } catch (error) {
+    const diagnostics = await inspectExamResultPage(page).catch(() => null);
+    return {
+      ok: false,
+      message: `考试读取失败：${String(error?.message || '未知错误').slice(0, 220)}。原有考试缓存已保留。`,
+      diagnostics,
+    };
+  }
+}
+
+
 async function diagnoseSchoolFlow() {
   // One shared cookie jar and sequential requests. The previous diagnostic used a new jar
   // for each URL, so its results could not describe a single navigation flow.
@@ -1106,6 +1600,14 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, service: 'campus-timetable-local-bridge', port: PORT, mode: 'njust-cas-headless-edge-v11-captcha-policy', targetConfigured: Boolean(safeSchoolUrl(TARGET_URLS[0])) }); return;
     }
     if (req.method === 'GET' && requestUrl.pathname === '/api/timetable') { sendJson(res, 200, await readTimetable()); return; }
+    if (req.method === 'GET' && requestUrl.pathname === '/api/exams') { sendJson(res, 200, await readExamData()); return; }
+    if (req.method === 'DELETE' && requestUrl.pathname.startsWith('/api/exams/')) {
+      const examId = decodeURIComponent(requestUrl.pathname.slice('/api/exams/'.length));
+      const current = await readExamData();
+      const exams = current.exams.filter((exam) => exam.id !== examId);
+      if (exams.length !== current.exams.length) await writeExamData({ ...current, exams });
+      sendJson(res, 200, { ok: true, removed: current.exams.length - exams.length, exams }); return;
+    }
     if (req.method === 'GET' && requestUrl.pathname === '/api/auth/status') {
       if (authState.phase === 'connected' && Date.now() - authState.lastScanAt >= AUTO_REFRESH_MS) await scanTimetable(false);
       sendJson(res, 200, publicAuthState()); return;
@@ -1135,6 +1637,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && requestUrl.pathname === '/api/auth/scan') {
       const result = await scanTimetable(true);
+      sendJson(res, result.ok ? 200 : 422, result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/exams') {
+      const result = await scanExams();
       sendJson(res, result.ok ? 200 : 422, result); return;
     }
     if (req.method === 'POST' && requestUrl.pathname === '/api/auth/close') {

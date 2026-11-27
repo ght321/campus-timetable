@@ -1,0 +1,1535 @@
+import http from 'node:http';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseNjustLoginForm, parseNjustTimetableHtml } from './njust-parser.mjs';
+import { parseNjustExamHtml } from './njust-exam-parser.mjs';
+import { chromium } from 'playwright-core';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(__dirname, '..');
+const dataDir = path.join(projectRoot, 'data');
+const dataFile = path.join(dataDir, 'timetable.json');
+const examDataFile = path.join(dataDir, 'exams.json');
+const HOST = '127.0.0.1';
+const PORT = Number(process.env.TIMETABLE_PORT || 3001);
+const MAX_BODY = 256 * 1024;
+const DEFAULT_TARGET_URLS = [
+  'https://bkjw.njust.edu.cn/njlgdx/xskb/xskb_list.do?Ves632DSdyV=NEW_XSD_PYGL',
+];
+// The EHALL service card explicitly exposes this PC launch URL. It starts the CAS
+// hand-off to the legacy timetable system; it is not the timetable URL itself.
+const SSO_ENTRY_HTTPS = 'https://bkjw.njust.edu.cn/njlgdx/indexsso.jsp';
+const SSO_ENTRY_OFFICIAL = 'http://bkjw.njust.edu.cn/njlgdx/indexsso.jsp';
+const TARGET_URLS = process.env.TIMETABLE_TARGET_URL ? [process.env.TIMETABLE_TARGET_URL] : DEFAULT_TARGET_URLS;
+// The order reflects the user's real navigation path. All HTTP requests in one attempt
+// share one cookie jar. The EHALL URL fragment (#/) is client-side and is not sent to HTTP.
+const SCHOOL_FLOW = [
+  { key: 'jwc', name: '教务处官网', url: 'https://jwc.njust.edu.cn/' },
+  { key: 'ehall', name: '网上办事服务大厅', url: 'https://ehall2.njust.edu.cn/default/index.html' },
+  { key: 'bkjw-sso-launch', name: '师生端应用启动入口（indexsso.jsp）', url: SSO_ENTRY_HTTPS },
+  { key: 'bkjw-home', name: '本科教务主页', url: 'https://bkjw.njust.edu.cn/njlgdx/framework/main.jsp' },
+];
+const AUTO_REFRESH_MS = 10 * 60 * 1000;
+
+const emptyTimetable = () => ({ school: '南京理工大学', semester: '', source: '', sourceUrl: '', lastSyncedAt: null, courses: [] });
+const emptyExamData = () => ({ school: '南京理工大学', source: '', sourceUrl: '', lastSyncedAt: null, exams: [] });
+const authState = {
+  phase: 'idle', message: '请输入校园账号和密码。', startedAt: null, lastDetectedAt: null,
+  error: '', jar: null, targetUrl: TARGET_URLS[0], pending: null, captchaDataUrl: '', lastScanAt: 0,
+  trace: [], diagnostics: null, captchaPolicy: [],
+  // Headless Edge page executes the official CAS form's own JavaScript, including any
+  // passwordText -> password transformation and dynamic hidden-field handling.
+  browser: null, context: null, page: null, username: '', password: '',
+};
+
+function safeSchoolUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || !isNjustHost(url.hostname)) return '';
+    return `${url.origin}${url.pathname}`.slice(0, 500);
+  } catch { return ''; }
+}
+function isNjustHost(hostname) { return hostname === 'njust.edu.cn' || hostname.endsWith('.njust.edu.cn'); }
+function isAllowedLegacySsoGet(url, method, enabled) {
+  // EHALL advertises the legacy PC entry point as HTTP. Permit only GET/HEAD
+  // navigation within the official bkjw /njlgdx app during the SSO ticket hand-off.
+  // Never permit a credential-bearing POST to HTTP.
+  return Boolean(enabled)
+    && ['GET', 'HEAD'].includes(String(method || 'GET').toUpperCase())
+    && url.protocol === 'http:'
+    && url.hostname === 'bkjw.njust.edu.cn'
+    && url.pathname.startsWith('/njlgdx/');
+}
+function assertSafeUrl(value, label = '目标地址', options = {}) {
+  const url = new URL(value);
+  if (url.protocol === 'https:' && isNjustHost(url.hostname)) return url;
+  if (isAllowedLegacySsoGet(url, options.method || 'GET', options.allowLegacySsoGet)) return url;
+  throw new Error(`${label}必须是南京理工大学域名下的 HTTPS 地址。仅在官方 SSO 交接时允许读取 bkjw.njust.edu.cn/njlgdx/ 的 HTTP 页面，绝不通过 HTTP 提交账号或密码。`);
+}
+function normalizeExam(exam, index) {
+  const name = String(exam?.name || '').trim().slice(0, 160);
+  if (!name) return null;
+  const source = exam?.source === 'manual' ? 'manual' : 'school';
+  return {
+    id: String(exam?.id || `exam-${index + 1}`).slice(0, 220),
+    name,
+    date: String(exam?.date || '日期待公布').trim().slice(0, 40),
+    time: String(exam?.time || '时间待公布').trim().slice(0, 80),
+    room: String(exam?.room || '暂未安排').trim().slice(0, 160),
+    seatNumber: String(exam?.seatNumber || '暂未安排').trim().slice(0, 80),
+    examNumber: String(exam?.examNumber || '').trim().slice(0, 80),
+    courseCode: String(exam?.courseCode || '').trim().slice(0, 80),
+    level: String(exam?.level || (source === 'school' ? '学校考试安排' : '手动添加')).trim().slice(0, 80),
+    invigilator: String(exam?.invigilator || '').trim().slice(0, 120),
+    source,
+  };
+}
+function normalizeCourse(course, index) {
+  const name = String(course?.name || course?.courseName || '').trim().slice(0, 160);
+  const day = Number(course?.day), start = Number(course?.start), end = Number(course?.end);
+  if (!name || !Number.isInteger(day) || day < 1 || day > 7 || !Number.isInteger(start) || start < 1 || start > 16 || !Number.isInteger(end) || end < start || end > 16) return null;
+  const colors = ['blue', 'green', 'purple', 'orange', 'pink'];
+  return {
+    id: String(course.id || `course-${index + 1}`).slice(0, 200), name,
+    teacher: String(course.teacher || '未识别').trim().slice(0, 120),
+    room: String(course.room || '未安排').trim().slice(0, 120),
+    day, start, end, weeks: String(course.weeks || '周次需核对').trim().slice(0, 100),
+    color: colors.includes(course.color) ? course.color : colors[index % colors.length],
+  };
+}
+async function readTimetable() {
+  try {
+    const raw = await fs.readFile(dataFile, 'utf8');
+    const data = JSON.parse(raw);
+    return { ...emptyTimetable(), ...data, courses: Array.isArray(data.courses) ? data.courses : [] };
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('读取本机课表失败：', error?.message || 'unknown error');
+    return emptyTimetable();
+  }
+}
+async function writeTimetable(data) {
+  await fs.mkdir(dataDir, { recursive: true });
+  const tempFile = `${dataFile}.tmp`;
+  await fs.writeFile(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(tempFile, dataFile);
+}
+async function readExamData() {
+  try {
+    const raw = await fs.readFile(examDataFile, 'utf8');
+    const data = JSON.parse(raw);
+    return { ...emptyExamData(), ...data, exams: Array.isArray(data.exams) ? data.exams.map(normalizeExam).filter(Boolean) : [] };
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('读取本机考试缓存失败：', error?.message || 'unknown error');
+    return emptyExamData();
+  }
+}
+async function writeExamData(data) {
+  await fs.mkdir(dataDir, { recursive: true });
+  const tempFile = `${examDataFile}.tmp`;
+  await fs.writeFile(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(tempFile, examDataFile);
+}
+
+function setCors(req, res) {
+  const origin = req.headers.origin || '';
+  const isLocalWeb = /^http:\/\/(localhost|127\.0\.0\.1):5\d{3}$/.test(origin);
+  if (!origin || isLocalWeb) {
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+}
+async function readJsonBody(req) {
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (Buffer.byteLength(body) > MAX_BODY) { const error = new Error('请求内容过大'); error.statusCode = 413; throw error; }
+  }
+  try { return JSON.parse(body || '{}'); } catch { const error = new Error('请求不是有效的 JSON'); error.statusCode = 400; throw error; }
+}
+function sendJson(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+  res.end(JSON.stringify(payload));
+}
+
+class CookieJar {
+  constructor() { this.cookies = new Map(); }
+  absorb(headers, requestUrl) {
+    const url = new URL(requestUrl);
+    const setCookies = typeof headers.getSetCookie === 'function'
+      ? headers.getSetCookie()
+      : (headers.get('set-cookie') ? [headers.get('set-cookie')] : []);
+    for (const item of setCookies) {
+      const [pair, ...attributes] = item.split(';');
+      const index = pair.indexOf('=');
+      if (index < 1) continue;
+      const name = pair.slice(0, index).trim();
+      const value = pair.slice(index + 1).trim();
+      const attrs = Object.fromEntries(attributes.map((a) => {
+        const i = a.indexOf('=');
+        return i < 0 ? [a.trim().toLowerCase(), true] : [a.slice(0, i).trim().toLowerCase(), a.slice(i + 1).trim()];
+      }));
+      const domain = String(attrs.domain || url.hostname).replace(/^\./, '').toLowerCase();
+      if (url.hostname !== domain && !url.hostname.endsWith(`.${domain}`)) continue;
+      const pathValue = typeof attrs.path === 'string' && attrs.path.startsWith('/') ? attrs.path : '/';
+      const key = `${domain}|${pathValue}|${name}`;
+      if (attrs['max-age'] === '0') { this.cookies.delete(key); continue; }
+      const expiresAt = attrs['max-age'] ? Date.now() + Number(attrs['max-age']) * 1000 : (attrs.expires ? Date.parse(attrs.expires) : 0);
+      this.cookies.set(key, { name, value, domain, path: pathValue, secure: Boolean(attrs.secure), expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0, hostOnly: !attrs.domain });
+    }
+  }
+  headerFor(requestUrl) {
+    const url = new URL(requestUrl);
+    const matches = [];
+    for (const [key, cookie] of this.cookies) {
+      if (cookie.expiresAt && cookie.expiresAt < Date.now()) { this.cookies.delete(key); continue; }
+      const domainOK = cookie.hostOnly ? url.hostname === cookie.domain : (url.hostname === cookie.domain || url.hostname.endsWith(`.${cookie.domain}`));
+      const pathOK = url.pathname === cookie.path || url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : `${cookie.path}/`);
+      if (domainOK && pathOK && (!cookie.secure || url.protocol === 'https:')) matches.push(cookie);
+    }
+    matches.sort((a, b) => b.path.length - a.path.length);
+    return matches.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
+  }
+}
+
+function safeLocation(value) {
+  try {
+    const url = new URL(value);
+    const secureSchoolUrl = url.protocol === 'https:' && isNjustHost(url.hostname);
+    const officialLegacySsoPath = url.protocol === 'http:' && url.hostname === 'bkjw.njust.edu.cn' && url.pathname.startsWith('/njlgdx/');
+    if (!secureSchoolUrl && !officialLegacySsoPath) return '已隐藏的外部地址';
+    // Do not return query strings: the CAS ticket is normally a query parameter.
+    return `${url.hostname}${url.pathname}`.slice(0, 240);
+  } catch { return '地址无法识别'; }
+}
+function recordTrace(method, requestUrl, status, contentType, redirectUrl = '') {
+  const entry = {
+    at: new Date().toISOString(),
+    method: String(method || 'GET').toUpperCase(),
+    from: safeLocation(requestUrl),
+    status: Number(status) || 0,
+    contentType: String(contentType || '').split(';')[0].slice(0, 80),
+    redirectTo: redirectUrl ? safeLocation(redirectUrl) : '',
+  };
+  authState.trace.push(entry);
+  if (authState.trace.length > 40) authState.trace.splice(0, authState.trace.length - 40);
+}
+function inspectHtml(html, url, status = 0) {
+  const form = parseNjustLoginForm(html, url);
+  const title = cleanHtmlText(String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '');
+  const rowMatch = String(html || '').match(/<table\b(?=[^>]*\bid\s*=\s*["']dataList["'])[^>]*>([\s\S]*?)<\/table\s*>/i);
+  const rowCount = rowMatch ? Math.max(0, [...rowMatch[1].matchAll(/<tr\b/gi)].length - 1) : 0;
+  const safeForm = form ? {
+    action: safeLocation(form.action), method: form.method,
+    usernameField: form.usernameName || '', passwordField: form.passwordName || '',
+    captchaField: form.captchaName || '', hiddenFieldNames: Object.keys(form.hidden || {}).slice(0, 30),
+  } : null;
+  return {
+    status: Number(status) || 0,
+    page: safeLocation(url), title: title.slice(0, 100),
+    loginFormDetected: Boolean(form), loginForm: safeForm,
+    dataListDetected: Boolean(rowMatch), dataListRows: rowCount,
+    scheduleGridDetected: /\bid\s*=\s*["']kbtable["']/i.test(String(html || '')),
+    hasExecutionTokenField: /name\s*=\s*["']execution["']/i.test(String(html || '')),
+    hasCaptchaImage: /<img\b[^>]*(?:captcha|capcha|验证码|validate)[^>]*>/i.test(String(html || '')),
+  };
+}
+async function requestWithJar(inputUrl, options = {}, jar) {
+  let method = options.method || 'GET';
+  let url = assertSafeUrl(inputUrl, '请求地址', { allowLegacySsoGet: options.allowLegacySsoGet, method });
+  let body = options.body;
+  let headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143 Safari/537.36', ...(options.headers || {}) };
+  for (let hop = 0; hop < 12; hop++) {
+    const cookie = jar.headerFor(url.href);
+    const requestHeaders = { ...headers };
+    if (cookie) requestHeaders.Cookie = cookie;
+    const response = await fetch(url, { method, headers: requestHeaders, body: method === 'GET' || method === 'HEAD' ? undefined : body, redirect: 'manual', signal: AbortSignal.timeout(Math.min(30000, Math.max(1000, Number(options.timeoutMs) || 30000))) });
+    jar.absorb(response.headers, url.href);
+    const location = response.headers.get('location');
+    let redirectUrl = '';
+    if (location && [301, 302, 303, 307, 308].includes(response.status)) {
+      try { redirectUrl = new URL(location, url).href; } catch { redirectUrl = ''; }
+    }
+    recordTrace(method, url.href, response.status, response.headers.get('content-type') || '', redirectUrl);
+    if (![301, 302, 303, 307, 308].includes(response.status)) return { response, url: url.href };
+    if (!location) return { response, url: url.href };
+    try { await response.body?.cancel(); } catch { /* response body may already be closed */ }
+    const nextMethod = response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST') ? 'GET' : method;
+    const nextBody = nextMethod === 'GET' || nextMethod === 'HEAD' ? undefined : body;
+    const next = assertSafeUrl(new URL(location, url).href, '学校认证跳转', { allowLegacySsoGet: options.allowLegacySsoGet, method: nextMethod });
+    if (nextMethod !== method) {
+      delete headers['Content-Type']; delete headers['content-type'];
+    }
+    method = nextMethod; body = nextBody;
+    url = next;
+  }
+  throw new Error('学校认证跳转次数过多，请重新从学校教务处入口尝试。');
+}
+async function getText(url, jar, options = {}) {
+  const { response, url: finalUrl } = await requestWithJar(url, options, jar);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get('content-type') || '';
+  const headerCharset = contentType.match(/charset\s*=\s*["']?([^;"'\s]+)/i)?.[1];
+  const metaCharset = bytes.subarray(0, 4096).toString('latin1').match(/<meta[^>]+charset\s*=\s*["']?([^;"'\s/>]+)/i)?.[1];
+  let charset = String(headerCharset || metaCharset || 'utf-8').toLowerCase();
+  if (charset === 'gb2312' || charset === 'gb_2312-80' || charset === 'x-gbk') charset = 'gbk';
+  if (charset === 'utf8') charset = 'utf-8';
+  let text;
+  try { text = new TextDecoder(charset).decode(bytes); }
+  catch { text = new TextDecoder('utf-8').decode(bytes); }
+  return { status: response.status, headers: response.headers, url: finalUrl, text };
+}
+function publicAuthState() {
+  return {
+    phase: authState.phase, message: authState.message, startedAt: authState.startedAt,
+    lastDetectedAt: authState.lastDetectedAt, error: authState.error,
+    needsCaptcha: authState.phase === 'needs_captcha', captchaDataUrl: authState.captchaDataUrl,
+    diagnostics: authState.diagnostics, trace: authState.trace.slice(-24),
+  };
+}
+async function resetAuth() {
+  const browser = authState.browser;
+  authState.browser = null;
+  authState.context = null;
+  authState.page = null;
+  authState.username = '';
+  authState.password = '';
+  authState.jar = null;
+  authState.pending = null;
+  authState.captchaDataUrl = '';
+  authState.phase = 'idle';
+  authState.error = '';
+  authState.lastScanAt = 0;
+  authState.trace = [];
+  authState.diagnostics = null;
+  authState.captchaPolicy = [];
+  if (browser) {
+    try { await browser.close(); } catch { /* browser already stopped */ }
+  }
+}
+
+async function prepareCaptcha(loginForm, formPageUrl, jar) {
+  if (!loginForm.captchaName) return '';
+  if (!loginForm.captchaImageUrl) return '';
+  const imageUrl = assertSafeUrl(loginForm.captchaImageUrl, '验证码图片地址');
+  // Random query is not injected: preserve the official URL and its session-bound challenge.
+  const { response } = await requestWithJar(imageUrl.href, { headers: { Referer: formPageUrl } }, jar);
+  const type = response.headers.get('content-type') || '';
+  if (!response.ok || !type.toLowerCase().startsWith('image/')) return '';
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > 1024 * 1024) return '';
+  return `data:${type.split(';')[0]};base64,${bytes.toString('base64')}`;
+}
+async function walkSchoolFlow(jar, { targetUrl = TARGET_URLS[0], phase = '登录链路探测', stopAtLoginForm = true } = {}) {
+  const stages = [
+    ...SCHOOL_FLOW,
+    { key: 'timetable', name: '个人课表页面', url: targetUrl },
+  ];
+  const results = [];
+  let foundForm = null;
+  let lastError = null;
+
+  for (const stage of stages) {
+    try {
+      // Deliberately sequential and sharing the same CookieJar. This is closer to the
+      // user's navigation order than independent anonymous GETs, but it still does not
+      // execute the EHALL SPA JavaScript or click its application tile.
+      const response = await getText(stage.url, jar, { timeoutMs: 15000, allowLegacySsoGet: stage.key.startsWith('bkjw') || stage.key === 'timetable' });
+      const inspected = inspectHtml(response.text, response.url, response.status);
+      results.push({ stage: stage.key, name: stage.name, ...inspected });
+
+      const parsed = parseNjustTimetableHtml(response.text, response.url);
+      if (stage.key === 'timetable' && parsed.courses.length) {
+        return { kind: 'timetable', response, parsed, results, targetUrl };
+      }
+
+      const loginForm = parseNjustLoginForm(response.text, response.url);
+      if (loginForm?.usernameName && loginForm?.passwordName) {
+        foundForm ||= { form: loginForm, response, stage };
+        // In login mode, stop at the first real form and use its action. In diagnostics,
+        // continue all stages using the same jar so later responses are also visible.
+        if (stopAtLoginForm) break;
+      }
+      if (stage.key === 'timetable' && !parsed.courses.length) {
+        lastError = new Error(`${safeLocation(response.url)} 返回了页面，但没有解析到课表课程。`);
+      }
+    } catch (error) {
+      const reason = error?.cause?.code || error?.message || '未知网络错误';
+      const message = `访问 ${stage.name} 失败（${String(reason).slice(0, 160)}）。`;
+      results.push({ stage: stage.key, name: stage.name, error: message });
+      lastError = new Error(message);
+      // Keep attempting the next stated step. A public page being unavailable should not
+      // prevent the diagnostic from revealing whether later official URLs respond.
+    }
+  }
+  return { kind: foundForm ? 'login-form' : 'no-course', foundForm, results, targetUrl, error: lastError?.message || '' };
+}
+
+function isAuthServerUrl(value) {
+  try { return new URL(value).hostname === 'ids.njust.edu.cn'; } catch { return false; }
+}
+function isBkjwUrl(value) {
+  try { const url = new URL(value); return url.hostname === 'bkjw.njust.edu.cn' && url.pathname.startsWith('/njlgdx/'); } catch { return false; }
+}
+
+async function visibleCount(page, selector) {
+  try {
+    const locator = page.locator(selector);
+    const count = await locator.count();
+    for (let i = 0; i < count; i++) if (await locator.nth(i).isVisible().catch(() => false)) return i + 1;
+  } catch { /* selector may not exist on this template */ }
+  return 0;
+}
+
+async function findCasForm(page) {
+  const pageHtml = await page.content();
+  const globalParsed = parseNjustLoginForm(pageHtml, page.url());
+  const forms = page.locator('form');
+  const formCount = await forms.count().catch(() => 0);
+
+  // The current CAS page contains several login modes (account, dynamic-code and QR).
+  // Do not simply choose the first <form> containing a password input: it may be a hidden
+  // form for another mode. Select the form whose account and password inputs are BOTH visible.
+  for (let formIndex = 0; formIndex < formCount; formIndex++) {
+    const form = forms.nth(formIndex);
+    const meta = await form.evaluate((element) => {
+      const visible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+      };
+      const inputs = Array.from(element.querySelectorAll('input'));
+      const valueOf = (input, key) => (input.getAttribute(key) || '').trim();
+      const descriptors = inputs.map((input, index) => ({
+        index,
+        name: valueOf(input, 'name'),
+        id: valueOf(input, 'id'),
+        type: (valueOf(input, 'type') || 'text').toLowerCase(),
+        placeholder: valueOf(input, 'placeholder'),
+        visible: visible(input),
+      }));
+      const password = descriptors.find((x) => x.visible && (x.type === 'password' || /password/i.test(`${x.name} ${x.id}`)));
+      const username = descriptors.find((x) => x.visible && x.type !== 'password' && /username|user.?name|user.?id|account|login.?name|学号|账号/i.test(`${x.name} ${x.id} ${x.placeholder}`))
+        || descriptors.find((x) => x.visible && ['text', 'tel', 'email'].includes(x.type) && !/captcha|capcha|verify|code|验证码|短信/i.test(`${x.name} ${x.id} ${x.placeholder}`));
+      const captcha = descriptors.find((x) => x.visible && /captcha|capcha|verify.?code|check.?code|验证码/i.test(`${x.name} ${x.id} ${x.placeholder}`));
+      const controls = Array.from(element.querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"],[onclick],.login-btn,.login_btn,.login-button'))
+        .filter(visible)
+        .map((el) => ({
+          tag: el.tagName.toLowerCase(), type: valueOf(el, 'type'), id: valueOf(el, 'id'),
+          name: valueOf(el, 'name'), cls: typeof el.className === 'string' ? el.className : '',
+          text: (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+        }));
+      return { html: element.outerHTML, descriptors, usernameIndex: username?.index ?? -1, passwordIndex: password?.index ?? -1, captchaIndex: captcha?.index ?? -1, username, password, captcha, controls };
+    }).catch(() => null);
+    if (!meta || meta.usernameIndex < 0 || meta.passwordIndex < 0) continue;
+    const formParsed = parseNjustLoginForm(meta.html, page.url()) || globalParsed;
+    return {
+      parsed: formParsed,
+      html: meta.html,
+      formIndex,
+      usernameInputIndex: meta.usernameIndex,
+      passwordInputIndex: meta.passwordIndex,
+      captchaInputIndex: meta.captchaIndex,
+      usernameSelector: meta.username?.name ? `input[name="${meta.username.name}"]` : (meta.username?.id ? `input#${meta.username.id}` : 'input[type="text"]'),
+      passwordSelector: meta.password?.name ? `input[name="${meta.password.name}"]` : (meta.password?.id ? `input#${meta.password.id}` : 'input[type="password"]'),
+      captchaSelector: meta.captcha?.name ? `input[name="${meta.captcha.name}"]` : (meta.captcha?.id ? `input#${meta.captcha.id}` : ''),
+      // Do not infer a challenge merely because HTML contains a hidden captcha field
+      // belonging to another/conditional login mode. Require a currently visible field.
+      hasCaptcha: meta.captchaIndex >= 0,
+      visibleSubmitControls: meta.controls,
+    };
+  }
+
+  // Fallback for templates with inputs outside a <form>. Still require visible fields and
+  // only use the official page's own submit handler; no hand-crafted credential POST.
+  const usernameSelector = 'input[name="username"]:visible, input[name*="user" i]:visible, input[id*="user" i]:visible';
+  const passwordSelector = 'input[name="passwordText"]:visible, input[type="password"]:visible';
+  if (!globalParsed || !(await visibleCount(page, usernameSelector)) || !(await visibleCount(page, passwordSelector))) return null;
+  const captchaSelector = 'input[name="captcha"]:visible, input[name*="captcha" i]:visible, input[name*="verify" i]:visible, input[name*="code" i]:visible';
+  return { parsed: globalParsed, html: pageHtml, formIndex: -1, usernameInputIndex: -1, passwordInputIndex: -1, captchaInputIndex: -1, usernameSelector, passwordSelector, captchaSelector, hasCaptcha: Boolean(globalParsed.captchaName && await visibleCount(page, captchaSelector)), visibleSubmitControls: [] };
+}
+
+function casInputLocator(page, info, type) {
+  const fieldIndex = type === 'username' ? info.usernameInputIndex : type === 'password' ? info.passwordInputIndex : info.captchaInputIndex;
+  if (Number.isInteger(info.formIndex) && info.formIndex >= 0 && Number.isInteger(fieldIndex) && fieldIndex >= 0) {
+    return page.locator('form').nth(info.formIndex).locator('input').nth(fieldIndex);
+  }
+  const selector = type === 'username' ? info.usernameSelector : type === 'password' ? info.passwordSelector : info.captchaSelector;
+  return selector ? page.locator(selector).first() : page.locator('input.__no_matching_captcha_field__');
+}
+
+async function captureBrowserCaptcha(page, formInfo) {
+  const captureDiag = {
+    inputDetected: Boolean(formInfo?.hasCaptcha),
+    visibleImageCount: 0,
+    candidateCount: 0,
+    selectedType: '',
+    selectedPath: '',
+    method: '',
+    note: '',
+  };
+  const saveDiag = () => {
+    authState.diagnostics = {
+      ...(authState.diagnostics || {}),
+      captchaCapture: { ...captureDiag },
+    };
+  };
+  const asDataUrl = (buffer, type = 'image/png') => {
+    if (!buffer?.length || buffer.length > 1024 * 1024) return '';
+    return `data:${type};base64,${buffer.toString('base64')}`;
+  };
+  const safePathOnly = (value) => {
+    try { const u = new URL(value, page.url()); return `${u.hostname}${u.pathname}`.slice(0, 180); }
+    catch { return ''; }
+  };
+
+  try {
+    // The CAS page may call checkNeedCaptcha.htl after fields receive focus/input and then
+    // inject or reveal the challenge image asynchronously. Wait briefly for its own scripts.
+    await page.waitForTimeout(900);
+    const captchaSelector = formInfo?.captchaSelector;
+    let input = null;
+    try {
+      if (captchaSelector) {
+        const locator = page.locator(captchaSelector).first();
+        if (await locator.count() && await locator.isVisible().catch(() => false)) input = locator;
+      }
+      if (!input) {
+        const candidates = page.locator('input:visible');
+        for (let i = 0; i < await candidates.count(); i++) {
+          const locator = candidates.nth(i);
+          const meta = await locator.evaluate((el) => ({
+            name: el.getAttribute('name') || '', id: el.id || '', placeholder: el.getAttribute('placeholder') || '',
+          })).catch(() => null);
+          if (meta && /captcha|capcha|verify.?code|check.?code|验证码|校验码/i.test(`${meta.name} ${meta.id} ${meta.placeholder}`)) { input = locator; break; }
+        }
+      }
+    } catch { /* try image candidates even if input locator cannot be recovered */ }
+
+    const inputBox = input ? await input.boundingBox().catch(() => null) : null;
+    const imageLocator = page.locator('img:visible');
+    const imageCount = await imageLocator.count().catch(() => 0);
+    captureDiag.visibleImageCount = imageCount;
+    const candidates = [];
+    const hints = /captcha|capcha|verify.?code|check.?code|validate|验证码|校验码|yzm/i;
+    const qrHints = /qrcode|qr-code|qr_code|scan|wechat|weixin|二维码/i;
+
+    for (let i = 0; i < imageCount; i++) {
+      const locator = imageLocator.nth(i);
+      const meta = await locator.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return {
+          src: el.currentSrc || el.src || '',
+          alt: el.getAttribute('alt') || '',
+          id: el.id || '',
+          name: el.getAttribute('name') || '',
+          cls: typeof el.className === 'string' ? el.className : '',
+          width: r.width, height: r.height, x: r.x, y: r.y,
+          naturalWidth: el.naturalWidth || 0, naturalHeight: el.naturalHeight || 0,
+          display: style.display, visibility: style.visibility,
+        };
+      }).catch(() => null);
+      if (!meta || meta.width < 8 || meta.height < 8) continue;
+      const signature = `${meta.src} ${meta.alt} ${meta.id} ${meta.name} ${meta.cls}`;
+      // Never mistake the portal's QR sign-in image for a text CAPTCHA.
+      if (qrHints.test(signature)) continue;
+      const explicitCaptchaHint = hints.test(signature);
+      const captchaLikeShape = meta.width >= 45 && meta.width <= 360 && meta.height >= 15 && meta.height <= 130
+        && (meta.width / Math.max(1, meta.height)) >= 1.05 && (meta.width / Math.max(1, meta.height)) <= 8;
+      // Avoid returning generic input icons/logos simply because they sit near the field.
+      if (!explicitCaptchaHint && !captchaLikeShape) continue;
+      let score = 0;
+      if (explicitCaptchaHint) score += 150;
+      if (meta.naturalWidth > 0 && meta.naturalHeight > 0) score += 10;
+      if (captchaLikeShape) score += 25;
+      if (inputBox) {
+        const distance = Math.hypot((meta.x + meta.width / 2) - (inputBox.x + inputBox.width / 2), (meta.y + meta.height / 2) - (inputBox.y + inputBox.height / 2));
+        score += Math.max(0, 70 - distance / 4);
+      }
+      const sameForm = input ? await locator.evaluate((el, selector) => {
+        const field = document.querySelector(selector);
+        return Boolean(field && el.closest('form') && el.closest('form') === field.closest('form'));
+      }, captchaSelector || '').catch(() => false) : false;
+      if (sameForm) score += 60;
+      candidates.push({ locator, meta, score, type: 'img' });
+    }
+    captureDiag.candidateCount = candidates.length;
+    candidates.sort((a, b) => b.score - a.score);
+
+    // Prefer a semantically identified image, otherwise the visible non-QR image nearest
+    // to the CAPTCHA input in the same form. Crop only the image, never the full login page.
+    if (candidates.length) {
+      const chosen = candidates[0];
+      const buffer = await chosen.locator.screenshot({ type: 'png', timeout: 7000 }).catch(() => null);
+      const dataUrl = asDataUrl(buffer);
+      if (dataUrl) {
+        captureDiag.selectedType = 'img';
+        captureDiag.selectedPath = safePathOnly(chosen.meta.src);
+        captureDiag.method = 'visible-image-screenshot';
+        captureDiag.note = '已从官方认证页面截取与验证码字段相关的非二维码图片。';
+        saveDiag();
+        return dataUrl;
+      }
+    }
+
+    // Some templates render the challenge as a CSS background, canvas, or an image in the
+    // CAPTCHA row whose URL/alt does not contain the word captcha. Find the nearest compact
+    // ancestor containing a non-QR visual and screenshot just that row.
+    if (input) {
+      const resultHandle = await input.evaluateHandle((el) => {
+        const isVisible = (node) => {
+          if (!node) return false;
+          const r = node.getBoundingClientRect();
+          const s = getComputedStyle(node);
+          return r.width > 12 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+        };
+        const hasVisual = (node) => {
+          for (const visual of node.querySelectorAll('img,canvas,svg,[style*="background"]')) {
+            if (!isVisible(visual)) continue;
+            const signature = `${visual.currentSrc || visual.src || ''} ${visual.id || ''} ${visual.className || ''} ${visual.getAttribute?.('alt') || ''}`;
+            if (/qrcode|qr-code|qr_code|scan|wechat|weixin|二维码/i.test(signature)) continue;
+            const vr = visual.getBoundingClientRect();
+            const hasCaptchaHint = /captcha|capcha|verify.?code|check.?code|validate|验证码|校验码|yzm/i.test(signature);
+            const captchaLikeShape = vr.width >= 45 && vr.width <= 360 && vr.height >= 15 && vr.height <= 130;
+            if (visual.tagName === 'IMG' && !(visual.naturalWidth > 0 && visual.naturalHeight > 0)) continue;
+            if (visual.tagName === 'CANVAS' && !(visual.width > 0 && visual.height > 0)) continue;
+            const bg = getComputedStyle(visual).backgroundImage;
+            if ((visual.tagName === 'IMG' || visual.tagName === 'CANVAS') && (hasCaptchaHint || captchaLikeShape)) return true;
+            if ((visual.tagName === 'SVG' || (bg && bg !== 'none')) && hasCaptchaHint) return true;
+          }
+          // Some sites put a background image directly on a wrapper in the CAPTCHA row.
+          const nr = node.getBoundingClientRect();
+          const bg = getComputedStyle(node).backgroundImage;
+          const classHint = /captcha|capcha|verify|validate|yzm/i.test(`${node.id || ''} ${node.className || ''}`);
+          return Boolean(bg && bg !== 'none' && !/qrcode|qr-code|scan|wechat|二维码/i.test(bg)
+            && (classHint || (nr.width >= 45 && nr.width <= 360 && nr.height >= 15 && nr.height <= 130)));
+        };
+        let node = el;
+        for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+          if (!isVisible(node)) continue;
+          const r = node.getBoundingClientRect();
+          if (r.width > 760 || r.height > 230) continue;
+          if (hasVisual(node)) return node;
+        }
+        return null;
+      }).catch(() => null);
+      const element = resultHandle?.asElement?.();
+      if (element) {
+        const buffer = await element.screenshot({ type: 'png', timeout: 7000 }).catch(() => null);
+        const dataUrl = asDataUrl(buffer);
+        if (dataUrl) {
+          captureDiag.selectedType = 'captcha-row';
+          captureDiag.method = 'nearest-captcha-row-screenshot';
+          captureDiag.note = '未识别到独立验证码图片，已截取验证码输入框附近、包含非二维码视觉元素的最小行区域。';
+          saveDiag();
+          await resultHandle.dispose().catch(() => {});
+          return dataUrl;
+        }
+      }
+      await resultHandle?.dispose?.().catch(() => {});
+    }
+
+    // Last fallback: inspect whether the input has an adjacent image/canvas/background and
+    // report counts, but never send a random logo or QR code as a CAPTCHA.
+    const visualDiag = await page.evaluate(() => {
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+        return r.width > 8 && r.height > 8 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+      };
+      const input = [...document.querySelectorAll('input')].find((el) => isVisible(el) && /captcha|capcha|verify.?code|check.?code|验证码|校验码/i.test(`${el.name} ${el.id} ${el.placeholder || ''}`));
+      const visible = [...document.querySelectorAll('img,canvas,svg')].filter(isVisible).map((el) => ({
+        tag: el.tagName.toLowerCase(), id: el.id || '', cls: typeof el.className === 'string' ? el.className : '',
+        w: Math.round(el.getBoundingClientRect().width), h: Math.round(el.getBoundingClientRect().height),
+        path: (() => { try { return el.src ? `${new URL(el.src).hostname}${new URL(el.src).pathname}` : ''; } catch { return ''; } })(),
+      })).filter((x) => !/qrcode|qr-code|qr_code|scan|wechat|weixin|二维码/i.test(`${x.id} ${x.cls} ${x.path}`)).slice(0, 20);
+      return { input: Boolean(input), nearbyAncestorTags: input ? [input.parentElement, input.parentElement?.parentElement, input.closest('form')].filter(Boolean).map((n) => `${n.tagName.toLowerCase()}${n.id ? `#${n.id}` : ''}.${String(n.className || '').toString().split(/\s+/).slice(0, 2).join('.')}`) : [], visibleVisualCount: visible.length, visuals: visible };
+    }).catch(() => ({ input: Boolean(formInfo?.hasCaptcha), visibleVisualCount: 0, visuals: [] }));
+    captureDiag.method = 'not-captured';
+    captureDiag.note = '检测到验证码输入框，但页面中没有找到可安全识别的非二维码挑战图片或验证码行。诊断只包含元素类型、尺寸与脱敏路径。';
+    captureDiag.pageVisuals = visualDiag;
+    saveDiag();
+    return '';
+  } catch (error) {
+    captureDiag.method = 'capture-error';
+    captureDiag.note = String(error?.message || '截图失败').slice(0, 160);
+    saveDiag();
+    return '';
+  }
+}
+
+function summarizeCaptchaPolicyResponse(text, status) {
+  const summary = { status: Number(status) || 0, parsed: false, signals: [], likelyRequired: null };
+  let root;
+  try { root = JSON.parse(String(text || '').trim()); summary.parsed = true; }
+  catch {
+    const raw = String(text || '').trim().toLowerCase();
+    if (raw === 'true' || raw === 'false' || raw === '1' || raw === '0') {
+      summary.parsed = true;
+      summary.signals.push({ key: 'response', value: raw === 'true' || raw === '1' });
+    }
+    summary.likelyRequired = summary.signals.length ? summary.signals[0].value : null;
+    return summary;
+  }
+  const allowedScalar = (value) => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number' && (value === 0 || value === 1)) return Boolean(value);
+    if (typeof value === 'string') {
+      const valueLower = value.trim().toLowerCase();
+      if (['true', 'yes', 'y', '1', 'required', 'needed'].includes(valueLower)) return true;
+      if (['false', 'no', 'n', '0', 'not-required', 'notneeded', 'none'].includes(valueLower)) return false;
+    }
+    return undefined;
+  };
+  const seen = new Set();
+  const walk = (value, prefix = '', depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 5 || seen.has(value)) return;
+    seen.add(value);
+    for (const [key, child] of Object.entries(value).slice(0, 80)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      // Only expose boolean-like policy flags. Never forward arbitrary response strings,
+      // opaque result codes, IDs, tokens, or response bodies to the UI.
+      if (/(?:need.?captcha|captcha.?need|is.?need|need.?verify|verify.?required|require.?captcha|show.?captcha)/i.test(path)) {
+        const scalar = allowedScalar(child);
+        if (scalar !== undefined && summary.signals.length < 12) summary.signals.push({ key: path.slice(0, 100), value: scalar });
+      }
+      if (child && typeof child === 'object') walk(child, path, depth + 1);
+    }
+  };
+  walk(root);
+  const positives = summary.signals.filter((signal) => signal.value === true);
+  const negatives = summary.signals.filter((signal) => signal.value === false);
+  summary.likelyRequired = positives.length ? true : negatives.length ? false : null;
+  return summary;
+}
+
+async function installBrowserTrace(page) {
+  page.on('request', (request) => {
+    try {
+      const url = request.url();
+      const parsedUrl = new URL(url);
+      if (parsedUrl.hostname !== 'ids.njust.edu.cn' || request.method().toUpperCase() !== 'POST' || !/authserver\/login/i.test(parsedUrl.pathname)) return;
+      authState.trace.push({ at: new Date().toISOString(), method: 'POST', from: safeLocation(url), status: 'request-started', contentType: '', redirectTo: '' });
+      if (authState.trace.length > 40) authState.trace.splice(0, authState.trace.length - 40);
+    } catch { /* diagnostics must never break authentication */ }
+  });
+  page.on('requestfailed', (request) => {
+    try {
+      const url = request.url();
+      const hostname = new URL(url).hostname;
+      const pathname = new URL(url).pathname;
+      if (!isNjustHost(hostname) || !/authserver\/login|checkNeedCaptcha|indexsso\.jsp|framework\/main\.jsp|xskb_list\.do/i.test(pathname)) return;
+      authState.trace.push({ at: new Date().toISOString(), method: request.method(), from: safeLocation(url), status: 'failed', contentType: '', redirectTo: '', failure: String(request.failure()?.errorText || 'request failed').slice(0, 100) });
+      if (authState.trace.length > 40) authState.trace.splice(0, authState.trace.length - 40);
+    } catch { /* diagnostics must never break authentication */ }
+  });
+  page.on('response', async (response) => {
+    try {
+      const request = response.request();
+      const url = response.url();
+      let hostname = '';
+      try { hostname = new URL(url).hostname; } catch { return; }
+      // Trace only the official school's traffic. URLs are sanitized by recordTrace,
+      // which removes query strings before anything is exposed to the UI.
+      if (!isNjustHost(hostname)) return;
+      const pathname = new URL(url).pathname;
+      const method = request.method().toUpperCase();
+      if (/\/checkNeedCaptcha\.htl$/i.test(pathname)) {
+        const bodyText = await response.text().catch(() => '');
+        const policy = summarizeCaptchaPolicyResponse(bodyText, response.status());
+        policy.at = new Date().toISOString();
+        authState.captchaPolicy.push(policy);
+        if (authState.captchaPolicy.length > 8) authState.captchaPolicy.splice(0, authState.captchaPolicy.length - 8);
+        if (authState.diagnostics && typeof authState.diagnostics === 'object') {
+          authState.diagnostics = { ...authState.diagnostics, captchaPolicy: authState.captchaPolicy.slice(-5) };
+        }
+      }
+      const important = method !== 'GET'
+        || /authserver\/login|checkNeedCaptcha|indexsso\.jsp|framework\/main\.jsp|xskb_list\.do|authserver\/.*(?:captcha|login)/i.test(pathname)
+        || request.resourceType() === 'document';
+      if (!important) return;
+      const headers = await response.allHeaders().catch(() => ({}));
+      const location = headers.location || '';
+      let absoluteLocation = '';
+      if (location) { try { absoluteLocation = new URL(location, url).href; } catch { /* ignore malformed Location */ } }
+      recordTrace(request.method(), url, response.status(), headers['content-type'] || '', absoluteLocation);
+    } catch { /* diagnostics must never break authentication */ }
+  });
+}
+
+async function launchOfficialBrowser(username, password) {
+  await resetAuth();
+  authState.startedAt = new Date().toISOString();
+  authState.phase = 'connecting';
+  authState.message = '正在本机后台启动 Edge，执行学校官方统一认证页面的 JavaScript……';
+  authState.username = username;
+  authState.password = password;
+  try {
+    // Use the user's installed Microsoft Edge in headless mode: no separate browser
+    // window opens, but the official login page's scripts and native form submission run.
+    authState.browser = await chromium.launch({ channel: 'msedge', headless: true });
+    authState.context = await authState.browser.newContext({ ignoreHTTPSErrors: false });
+    authState.page = await authState.context.newPage();
+    await authState.page.setViewportSize({ width: 1365, height: 1000 });
+    authState.page.setDefaultNavigationTimeout(45000);
+    authState.page.setDefaultTimeout(12000);
+    await installBrowserTrace(authState.page);
+    // This HTTPS URL matches the official pcAccessUrl's path and was observed to redirect
+    // to the CAS page with service=http://bkjw.../indexsso.jsp.
+    await authState.page.goto(SSO_ENTRY_HTTPS, { waitUntil: 'domcontentloaded' });
+    await authState.page.waitForTimeout(500);
+    const page = authState.page;
+    const html = await page.content();
+    const info = await findCasForm(page);
+    const parsedSchedule = parseNjustTimetableHtml(html, page.url());
+    authState.diagnostics = {
+      kind: 'njust-browser-cas-auth',
+      currentPage: safeLocation(page.url()),
+      title: String(await page.title().catch(() => '')).slice(0, 100),
+      loginFormDetected: Boolean(info),
+      usernameFieldDetected: Boolean(info),
+      visiblePasswordFieldName: info?.parsed?.passwordName || '',
+      hiddenFieldNames: Object.keys(info?.parsed?.hidden || {}).slice(0, 30),
+      captchaFieldDetected: Boolean(info?.hasCaptcha),
+      hasExecutionTokenField: Object.keys(info?.parsed?.hidden || {}).includes('execution'),
+      captchaPolicy: authState.captchaPolicy.slice(-5),
+      captchaCapture: { method: 'not-attempted-yet', inputDetected: Boolean(info?.hasCaptcha), note: '先区分可见验证码输入框与 HTML 中的隐藏/条件字段；只有当前页面确实显示验证码输入框时才尝试采图。' },
+      method: 'headless-msedge-official-form-js-v11',
+      note: '由本机安装的 Edge 执行学校官方登录页面脚本和表单提交，不再由 Node 手工猜测 passwordText/隐藏 password 的转换方式。认证 Cookie 仅保存在该浏览器上下文内存，不返回给前端或写入文件。',
+    };
+
+    if (parsedSchedule.courses.length) {
+      await saveParsedTimetable(parsedSchedule, page.url());
+      authState.phase = 'connected';
+      authState.message = `已读取 ${parsedSchedule.courses.length} 个课程时段。`;
+      authState.targetUrl = TARGET_URLS[0];
+      authState.lastScanAt = Date.now();
+      return { ok: true, ...publicAuthState(), count: parsedSchedule.courses.length };
+    }
+
+    if (!info) {
+      authState.phase = 'error';
+      authState.error = `打开师生端启动入口后没有发现可见的标准账号密码表单（页面：${safeLocation(page.url())}）。`;
+      authState.message = `${authState.error} 页面可能需要扫码、额外验证，或学校调整了登录页面结构。`;
+      return { ok: false, status: 422, ...publicAuthState() };
+    }
+
+    const user = casInputLocator(page, info, 'username');
+    const pass = casInputLocator(page, info, 'password');
+    await user.fill(username);
+    await pass.fill(password);
+    // The official CAS page evaluates whether this account/session needs a challenge.
+    // Trigger normal input/blur events, then allow its checkNeedCaptcha request to finish.
+    await pass.blur().catch(() => {});
+    await page.waitForTimeout(1400);
+    const activeInfo = await findCasForm(page).catch(() => null) || info;
+    authState.pending = { formPageUrl: page.url(), targetUrl: TARGET_URLS[0] };
+    authState.targetUrl = TARGET_URLS[0];
+    authState.diagnostics = {
+      ...(authState.diagnostics || {}),
+      captchaPolicy: authState.captchaPolicy.slice(-5),
+      captchaCapture: { method: 'not-attempted-yet', inputDetected: Boolean(activeInfo.hasCaptcha), note: '根据可见输入框与官方 checkNeedCaptcha 响应判断是否真的需要图形验证码。' },
+    };
+
+    const latestPolicy = authState.captchaPolicy.at(-1);
+    const policyRequiresCaptcha = latestPolicy?.likelyRequired === true;
+    const policySaysNoCaptcha = latestPolicy?.likelyRequired === false;
+    if (activeInfo.hasCaptcha || policyRequiresCaptcha) {
+      authState.captchaDataUrl = await captureBrowserCaptcha(page, activeInfo);
+      // If the form contains an invisible conditional field but the official checker says
+      // no challenge is required, do not block the normal official login flow.
+      if (authState.captchaDataUrl || policyRequiresCaptcha || (!policySaysNoCaptcha && activeInfo.hasCaptcha)) {
+        authState.phase = 'needs_captcha';
+        authState.message = authState.captchaDataUrl
+          ? '学校当前要求验证码。请在 CampusTimetable 输入图片中的字符，再提交；不会自动识别或绕过验证码。'
+          : `学校的认证页面指示需要验证码，但尚未获取到可显示的挑战图片。诊断已增加 captchaPolicy 和 captchaCapture；若官方页面没有加载挑战图片，程序不会用二维码冒充。`;
+        return { ok: true, ...publicAuthState() };
+      }
+    }
+    // Hidden fields for SMS/other auth modes do not by themselves mean account login
+    // requires a CAPTCHA. Try the official page's normal submit handler when policy says no.
+    return await submitLogin('', '', '', { browserMode: true });
+  } catch (error) {
+    const reason = error?.cause?.code || error?.message || '未知错误';
+    authState.phase = 'error';
+    authState.error = `启动本机后台 Edge 认证失败：${String(reason).slice(0, 200)}`;
+    authState.message = `${authState.error}。请确认已安装 Microsoft Edge，并在项目中执行 npm install。`;
+    authState.diagnostics = { kind: 'njust-browser-cas-auth', trace: authState.trace.slice(-24), note: '不会打开独立的可见浏览器窗口；此模式需要本机 Edge 可被 Playwright 启动。' };
+    return { ok: false, status: 422, ...publicAuthState() };
+  }
+}
+
+async function clickOfficialLoginButton(page) {
+  const info = await findCasForm(page);
+  if (!info) throw new Error('当前页面已不再显示统一认证账号密码表单。');
+  const loginText = /登录|登陆|log\s*in|submit/i;
+  const loginControls = [
+    '#login_submit:visible', '#loginSubmit:visible', '#loginButton:visible', '#btnLogin:visible',
+    'button[type="submit"]:visible', 'input[type="submit"]:visible',
+    '.login-btn:visible', '.login_btn:visible', '.login-button:visible',
+    '[role="button"]:visible', 'button:visible', 'input[type="button"]:visible',
+    'a[onclick]:visible', 'div[onclick]:visible', 'span[onclick]:visible', 'a:visible',
+  ];
+  const roots = [];
+  if (Number.isInteger(info.formIndex) && info.formIndex >= 0) roots.push(page.locator('form').nth(info.formIndex));
+  roots.push(page);
+
+  // Prefer an actual visible login control. The authentication page contains multiple
+  // forms for QR/dynamic-code/account modes; submitting the first password-form found can
+  // target a hidden mode and leave the page with no /authserver/login POST at all.
+  for (const root of roots) {
+    for (const selector of loginControls) {
+      const locator = root.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const control = locator.nth(i);
+        if (!(await control.isVisible().catch(() => false))) continue;
+        const meta = await control.evaluate((el) => ({
+          tag: el.tagName.toLowerCase(), type: (el.getAttribute('type') || '').toLowerCase(),
+          value: el.value || '', text: el.innerText || '', aria: el.getAttribute('aria-label') || '',
+          title: el.getAttribute('title') || '', id: el.id || '',
+          cls: typeof el.className === 'string' ? el.className : '',
+        })).catch(() => null);
+        if (!meta || !loginText.test(`${meta.value} ${meta.text} ${meta.aria} ${meta.title} ${meta.id} ${meta.cls}`)) continue;
+        await control.click({ timeout: 5000 });
+        authState.diagnostics = {
+          ...(authState.diagnostics || {}),
+          submitTrigger: `click:${meta.tag}${meta.id ? `#${meta.id}` : ''}`.slice(0, 120),
+          selectedFormIndex: info.formIndex,
+        };
+        return;
+      }
+    }
+  }
+
+  // If the template uses an unlabeled submit element, try that before requestSubmit.
+  if (Number.isInteger(info.formIndex) && info.formIndex >= 0) {
+    const form = page.locator('form').nth(info.formIndex);
+    const submit = form.locator('input[type="submit"]:visible,button[type="submit"]:visible').first();
+    if (await submit.count().catch(() => 0)) {
+      await submit.click({ timeout: 5000 });
+      authState.diagnostics = { ...(authState.diagnostics || {}), submitTrigger: 'click:submit-control', selectedFormIndex: info.formIndex };
+      return;
+    }
+    const result = await form.evaluate((element) => {
+      if (typeof element.requestSubmit === 'function') { element.requestSubmit(); return 'requestSubmit'; }
+      return 'no-requestSubmit';
+    });
+    authState.diagnostics = { ...(authState.diagnostics || {}), submitTrigger: result, selectedFormIndex: info.formIndex };
+    if (result === 'requestSubmit') return;
+  }
+  throw new Error('已填写账号密码，但未找到可见的官方登录按钮，也无法触发当前可见表单的 requestSubmit；本次没有提交任何登录请求。请检查认证页的登录按钮结构。');
+}
+
+async function finishBrowserLogin(captcha = '') {
+  const page = authState.page;
+  if (!page || !authState.context || !authState.browser) throw new Error('后台认证会话已失效，请重新发起登录。');
+  const info = await findCasForm(page);
+  if (!info) {
+    authState.phase = 'error';
+    authState.message = '当前后台浏览器不再显示认证表单；请重新发起登录以建立新的认证会话。';
+    return { ok: false, status: 422, ...publicAuthState() };
+  }
+  if (info.hasCaptcha) {
+    if (!captcha.trim()) throw new Error('请输入学校验证码。');
+    await casInputLocator(page, info, 'captcha').fill(captcha.trim());
+  }
+  authState.phase = 'authenticating';
+  authState.message = '正在由本机后台 Edge 执行学校官方登录脚本，并等待 SSO 回调……';
+  authState.error = '';
+  const previousLoginPosts = authState.trace.filter((entry) => entry.method === 'POST' && /ids\.njust\.edu\.cn\/authserver\/login/i.test(entry.from)).length;
+  await clickOfficialLoginButton(page);
+  await page.waitForTimeout(2200);
+  const currentLoginPosts = authState.trace.filter((entry) => entry.method === 'POST' && /ids\.njust\.edu\.cn\/authserver\/login/i.test(entry.from)).length;
+  authState.diagnostics = {
+    ...(authState.diagnostics || {}),
+    loginPostObserved: currentLoginPosts > previousLoginPosts,
+    loginPostAttemptsInSession: currentLoginPosts,
+  };
+
+  // Wait briefly for redirect chains and JS-based form handlers to finish.
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+  } catch { /* a same-document transition is also possible */ }
+  let currentUrl = page.url();
+  let currentHtml = await page.content().catch(() => '');
+  let infoAfter = await findCasForm(page).catch(() => null);
+  if (isAuthServerUrl(currentUrl) && infoAfter) {
+    // Keep only local-memory state so a retry can refill the page if the identity provider
+    // cleared the password field after rejecting the request. Never persist credentials.
+    const user = casInputLocator(page, infoAfter, 'username');
+    const pass = casInputLocator(page, infoAfter, 'password');
+    if (await user.count()) await user.fill(authState.username).catch(() => {});
+    if (await pass.count()) await pass.fill(authState.password).catch(() => {});
+    authState.captchaDataUrl = await captureBrowserCaptcha(page, infoAfter);
+    authState.phase = infoAfter.hasCaptcha ? 'needs_captcha' : 'error';
+    const pageText = cleanHtmlText(currentHtml);
+    const loginError = /验证码错误|验证码不正确|用户名或密码错误|密码错误|认证失败|登录失败|账号或密码错误|invalid credentials/i.test(pageText);
+    const loginPostObserved = Boolean(authState.diagnostics?.loginPostObserved);
+    authState.message = loginError
+      ? '学校仍返回统一认证页面。页面提示认证未通过，可能是账号密码、验证码或其他验证条件；请核对后重试。'
+      : (!loginPostObserved
+        ? '登录按钮已尝试触发，但没有观察到向统一认证 /authserver/login 提交的 POST 请求。问题更可能在登录按钮/表单选择，不是验证码图片获取；请查看脱敏诊断中的 submitTrigger。'
+        : '已观察到认证 POST 请求，但学校仍停留在统一身份认证页面。请检查是否存在密码处理、验证码、动态令牌或其他验证要求。');
+    authState.error = authState.phase === 'error' ? authState.message : '';
+    const priorDiagnostics = authState.diagnostics || {};
+    authState.diagnostics = {
+      kind: 'njust-browser-cas-auth-result', currentPage: safeLocation(currentUrl),
+      title: String(await page.title().catch(() => '')).slice(0, 100),
+      loginFormStillPresent: true, captchaFieldDetected: Boolean(infoAfter.hasCaptcha),
+      hasExecutionTokenField: Object.keys(infoAfter.parsed.hidden || {}).includes('execution'),
+      hiddenFieldNames: Object.keys(infoAfter.parsed.hidden || {}).slice(0, 30),
+      selectedFormIndex: infoAfter.formIndex,
+      submitTrigger: priorDiagnostics.submitTrigger || '',
+      loginPostObserved: Boolean(priorDiagnostics.loginPostObserved),
+      loginPostAttemptsInSession: Number(priorDiagnostics.loginPostAttemptsInSession || 0),
+      visibleSubmitControls: infoAfter.visibleSubmitControls || [],
+      captchaPolicy: authState.captchaPolicy.slice(-5),
+      captchaCapture: priorDiagnostics.captchaCapture || { method: 'not-attempted', inputDetected: Boolean(infoAfter.hasCaptcha), note: '尚未尝试截取当前验证码图。' },
+      trace: authState.trace.slice(-24),
+      note: '浏览器执行了官方页面脚本。此诊断不包含账号、密码、Cookie、Token、Ticket、隐藏字段值或页面正文。',
+    };
+    return { ok: false, status: 422, ...publicAuthState() };
+  }
+
+  authState.diagnostics = {
+    kind: 'njust-browser-cas-auth-result', currentPage: safeLocation(currentUrl),
+    title: String(await page.title().catch(() => '')).slice(0, 100),
+    trace: authState.trace.slice(-24),
+    note: '登录使用真实浏览器运行时执行学校页面脚本和跳转；认证票据和 Cookie 不返回给前端。',
+  };
+
+  // Require the expected school domain before fetching a timetable; never treat a random
+  // redirect as a successful login.
+  if (!isBkjwUrl(currentUrl)) {
+    try {
+      await page.goto(SSO_ENTRY_HTTPS, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      currentUrl = page.url();
+    } catch { /* retain original URL for diagnostic below */ }
+  }
+  try {
+    await page.goto(TARGET_URLS[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(250);
+    currentHtml = await page.content();
+    const parsed = parseNjustTimetableHtml(currentHtml, page.url());
+    authState.diagnostics = {
+      kind: 'njust-browser-timetable-result', currentPage: safeLocation(page.url()),
+      title: String(await page.title().catch(() => '')).slice(0, 100),
+      dataListDetected: /\bid\s*=\s*["']dataList["']/i.test(currentHtml),
+      trace: authState.trace.slice(-24),
+      note: '课表页由同一个后台 Edge 会话加载，登录 Cookie 在浏览器上下文中维持；只保存解析得到的课程字段。',
+    };
+    if (!parsed.courses.length) {
+      const possibleForm = parseNjustLoginForm(currentHtml, page.url());
+      authState.phase = possibleForm ? 'error' : 'schedule_not_parsed';
+      authState.message = possibleForm
+        ? 'SSO 回调后访问课表仍被重定向到认证页面，学校会话没有建立或没有通过 indexsso.jsp 回调。'
+        : `已经离开登录页面，但课表页面未识别到课程（HTTP/页面：${safeLocation(page.url())}）。请检查课表页面结构。`;
+      authState.error = authState.phase === 'error' ? authState.message : '';
+      return { ok: false, status: 422, ...publicAuthState() };
+    }
+    await saveParsedTimetable(parsed, page.url());
+    authState.phase = 'connected';
+    authState.message = `登录成功，已从师生端读取 ${parsed.courses.length} 个课程时段。`;
+    authState.lastDetectedAt = new Date().toISOString();
+    authState.lastScanAt = Date.now();
+    authState.error = '';
+    authState.password = '';
+    authState.username = '';
+    return { ok: true, ...publicAuthState(), count: parsed.courses.length };
+  } catch (error) {
+    authState.phase = 'error';
+    authState.error = String(error?.message || '读取课表失败').slice(0, 240);
+    authState.message = `认证后读取课表失败：${authState.error}`;
+    return { ok: false, status: 422, ...publicAuthState() };
+  }
+}
+
+async function beginLogin(username, password) {
+  if (!username?.trim() || !password) throw new Error('请输入学号和密码。');
+  await resetAuth();
+  authState.trace = [];
+  authState.targetUrl = TARGET_URLS[0];
+  const launched = await launchOfficialBrowser(username.trim(), password);
+  if (!launched.ok || launched.phase !== 'needs_captcha') return launched;
+  return launched;
+}
+
+async function submitLogin(_username, _password, captcha = '') {
+  // Credentials are retained only in process memory during this short authentication flow;
+  // actual form filling, client-side password processing, hidden fields, CSRF fields, captcha
+  // and submit handlers are executed by official CAS JavaScript in headless Edge.
+  return await finishBrowserLogin(captcha);
+}
+
+function cleanHtmlText(html) {
+  return String(html || '').replace(/<script\b[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim().slice(0, 10000);
+}
+async function saveParsedTimetable(parsed, sourceUrl) {
+  const courses = (parsed.courses || []).map(normalizeCourse).filter(Boolean);
+  if (!courses.length) throw new Error('课表页面返回成功，但没有识别到有效课程。为了避免覆盖旧数据，本次未保存空课表。');
+  const nowIso = new Date().toISOString();
+  await writeTimetable({
+    school: '南京理工大学', semester: String(parsed.semester || '').slice(0, 100),
+    source: '南京理工大学师生端 HTTPS 课表页面解析', sourceUrl: safeSchoolUrl(sourceUrl),
+    lastSyncedAt: nowIso, courses,
+  });
+  authState.lastDetectedAt = nowIso; authState.lastScanAt = Date.now();
+}
+async function scanTimetable(force = false) {
+  const page = authState.page;
+  if (!page || !authState.browser || authState.phase !== 'connected') return { ok: false, message: '还没有建立学校认证会话，请先登录。' };
+  if (!force && Date.now() - authState.lastScanAt < AUTO_REFRESH_MS) return { ok: true, message: authState.message, skipped: true };
+  try {
+    await page.goto(TARGET_URLS[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(200);
+    const html = await page.content();
+    authState.diagnostics = {
+      kind: 'njust-browser-refresh', currentPage: safeLocation(page.url()),
+      title: String(await page.title().catch(() => '')).slice(0, 100),
+      trace: authState.trace.slice(-24),
+      note: '刷新使用当前后台 Edge 的同一认证会话，不提取或序列化 Cookie。',
+    };
+    const parsed = parseNjustTimetableHtml(html, page.url());
+    if (!parsed.courses.length) {
+      const form = parseNjustLoginForm(html, page.url());
+      if (form || isAuthServerUrl(page.url())) {
+        authState.phase = 'session_expired';
+        authState.message = '教务系统会话可能已过期，请重新登录后获取课表。';
+        return { ok: false, message: authState.message };
+      }
+      authState.phase = 'schedule_not_parsed';
+      authState.message = '请求返回的页面中未识别到有效课程；旧课表保留不变。';
+      return { ok: false, message: authState.message };
+    }
+    await saveParsedTimetable(parsed, page.url());
+    authState.phase = 'connected';
+    authState.message = `课表已更新：读取到 ${parsed.courses.length} 个课程时段。`;
+    authState.error = '';
+    return { ok: true, count: parsed.courses.length, lastSyncedAt: authState.lastDetectedAt, message: authState.message };
+  } catch (error) {
+    authState.error = String(error?.message || '刷新课表失败').slice(0, 240);
+    authState.message = `刷新课表失败：${authState.error}`;
+    return { ok: false, message: authState.message };
+  }
+}
+
+// Exam flow follows the Android WebView sequence: main page -> query page -> native query button.
+
+async function inspectExamResultPage(page) {
+  try {
+    return await page.evaluate(() => {
+      const tidy = (value) => String(value || '').replace(/[\\s\\u00a0\\u3000]+/g, ' ').trim().slice(0, 80);
+      const tables = Array.from(document.querySelectorAll('table')).slice(0, 12).map((table) => {
+        const rows = Array.from(table.querySelectorAll('tr'));
+        return {
+          id: table.id || '',
+          className: typeof table.className === 'string' ? table.className.slice(0, 100) : '',
+          rowCount: rows.length,
+          header: rows[0] ? Array.from(rows[0].querySelectorAll('th,td')).map((cell) => tidy(cell.innerText || cell.textContent)).slice(0, 10) : [],
+          dataCellCounts: rows.slice(1, 6).map((row) => row.querySelectorAll('td').length),
+        };
+      });
+      const forms = Array.from(document.forms).slice(0, 8).map((form) => {
+        let actionPath = '';
+        try { actionPath = new URL(form.getAttribute('action') || location.href, location.href).pathname; } catch { /* keep path empty */ }
+        return {
+          id: form.id || '', actionPath,
+          method: String(form.getAttribute('method') || 'GET').toUpperCase(),
+          fields: Array.from(form.querySelectorAll('input,select,textarea')).slice(0, 24).map((field) => ({
+            tag: field.tagName.toLowerCase(), type: field.getAttribute('type') || '',
+            name: field.getAttribute('name') || '', id: field.id || '',
+          })),
+        };
+      });
+      return {
+        page: location.pathname,
+        title: document.title || '',
+        readyState: document.readyState,
+        dataListPresent: Boolean(document.querySelector('#dataList')),
+        bodyTextLength: document.body?.innerText?.length || 0,
+        tables,
+        forms,
+      };
+    });
+  } catch (error) {
+    return { page: safeLocation(page.url()), error: String(error?.message || '读取考试结果页结构失败').slice(0, 160) };
+  }
+}
+
+async function scanExams() {
+  const page = authState.page;
+  const context = authState.context;
+  if (!page || !context || !authState.browser || authState.phase !== 'connected') {
+    return { ok: false, message: '还没有建立学校认证会话，请先在“个人信息”页面登录并同步课表。' };
+  }
+
+  const EXAM_MAIN_URL = 'https://bkjw.njust.edu.cn/njlgdx/framework/main.jsp';
+  const EXAM_QUERY_PATH = '/njlgdx/xsks/xsksap_query';
+  const EXAM_LIST_PATH = '/njlgdx/xsks/xsksap_list';
+  const framePath = (frame) => {
+    try { return new URL(frame.url()).pathname; } catch { return ''; }
+  };
+  const findExamFrame = () => page.frames().find((frame) =>
+    [EXAM_QUERY_PATH, EXAM_LIST_PATH].includes(framePath(frame))
+  ) || null;
+  const safeFramePath = (frame) => safeLocation(frame.url());
+
+  try {
+    // 与 Android 一致：复用当前已认证会话，先从教务主页进入考试报名。
+    await page.goto(EXAM_MAIN_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(800);
+
+    let entryClicked = false;
+    let entryInfo = null;
+    let examFrame = findExamFrame();
+
+    // Android 会遍历主页面和子 frame；桌面端也逐个检查所有 frame。
+    for (let attempt = 0; attempt < 15 && !examFrame; attempt++) {
+      for (const frame of page.frames()) {
+        if (frame.isDetached()) continue;
+        const result = await frame.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a[href]'));
+          const link = links.find((element) => {
+            try {
+              const target = new URL(element.getAttribute('href'), document.location.href);
+              return target.hostname === 'bkjw.njust.edu.cn'
+                && target.pathname === '/njlgdx/xsks/xsksap_query';
+            } catch { return false; }
+          });
+          if (!link) return null;
+          const info = {
+            clicked: true,
+            text: String(link.innerText || link.textContent || '').trim().slice(0, 80),
+          };
+          link.click();
+          return info;
+        }).catch(() => null);
+
+        if (result?.clicked) {
+          entryClicked = true;
+          entryInfo = result;
+          break;
+        }
+      }
+
+      examFrame = findExamFrame();
+      if (!examFrame) await page.waitForTimeout(500);
+    }
+
+    // 如果点击动作触发了导航，evaluate 回调可能被导航打断；以实际 frame URL 为准。
+    examFrame = findExamFrame();
+    if (!examFrame) {
+      const frameDiagnostics = await Promise.all(page.frames().map(async (frame) => ({
+        page: safeFramePath(frame),
+        title: await frame.title().catch(() => ''),
+      })));
+      return {
+        ok: false,
+        message: entryClicked
+          ? '已点击教务主页的考试报名入口，但没有进入考试查询页面。原有考试缓存已保留。'
+          : '教务主页中未找到考试报名链接。原有考试缓存已保留。',
+        diagnostics: {
+          page: safeLocation(page.url()),
+          title: await page.title().catch(() => ''),
+          entryText: entryInfo?.text || '',
+          frames: frameDiagnostics,
+        },
+      };
+    }
+
+    // Android 在考试查询页 onPageFinished 后等待约 1200 ms，再点击原生查询按钮。
+    let queryActionInfo = null;
+    if (framePath(examFrame) === EXAM_QUERY_PATH) {
+      await page.waitForTimeout(1200);
+      const queryAction = await examFrame.evaluate(() => {
+        const button = document.getElementById('btn_query');
+        const form = document.getElementById('ksapQueryForm');
+        const term = document.getElementById('xnxqid');
+        if (!button) return { ok: false, reason: 'BTN_NOT_FOUND' };
+        if (!form) return { ok: false, reason: 'FORM_NOT_FOUND' };
+        if (button.disabled) return { ok: false, reason: 'BUTTON_DISABLED' };
+
+        const info = {
+          ok: true,
+          semester: term ? String(term.value || '').slice(0, 40) : '',
+          semesterText: term && term.options && term.selectedIndex >= 0 ? String(term.options[term.selectedIndex].text || '').trim().slice(0, 80) : '',
+          semesterOptionCount: term && term.options ? term.options.length : 0,
+          hasOnClick: button.hasAttribute('onclick') || typeof button.onclick === 'function',
+          buttonType: String(button.type || '').toLowerCase(),
+          buttonText: String(button.innerText || button.textContent || button.value || '').trim().slice(0, 40),
+          formElementCount: form.elements ? form.elements.length : 0,
+          method: String(form.method || 'GET').toUpperCase(),
+          actionPath: (() => {
+            try { return new URL(form.getAttribute('action') || document.location.href, document.location.href).pathname; }
+            catch { return ''; }
+          })(),
+        };
+        // 必须触发学校页面自己的 onclick/submit 逻辑，不绕过它自行拼接请求。
+        button.click();
+        return info;
+      }).catch((error) => ({ ok: false, reason: `QUERY_CLICK_ERROR: ${String(error?.message || error).slice(0, 120)}` }));
+      queryActionInfo = queryAction;
+
+      if (!queryAction.ok) {
+        // click() 可能触发同 URL 的 POST/页面重载，导致 evaluate 回调被销毁。
+        // 这种情况下 xsksap_query 本身也是有效结果容器，不能只接受 xsksap_list。
+        if (String(queryAction.reason || '').startsWith('QUERY_CLICK_ERROR')) {
+          await page.waitForTimeout(1500);
+          examFrame = findExamFrame();
+          if (!examFrame) {
+            return {
+              ok: false,
+              message: '点击学校考试查询按钮后页面发生跳转，但没有检测到考试查询结果页面。原有考试缓存已保留。',
+              diagnostics: {
+                page: safeLocation(page.url()),
+                queryButton: queryAction.reason,
+              },
+            };
+          }
+          // 若导航后仍为 xsksap_query，继续轮询该页面的 AJAX/POST 更新结果。
+        } else {
+          examFrame = findExamFrame();
+          if (!examFrame || framePath(examFrame) !== EXAM_LIST_PATH) {
+            return {
+              ok: false,
+              message: `未能执行学校考试查询按钮（${queryAction.reason || 'UNKNOWN'}）。原有考试缓存已保留。`,
+              diagnostics: {
+                page: safeLocation(examFrame?.url() || page.url()),
+                title: examFrame ? await examFrame.title().catch(() => '') : await page.title().catch(() => ''),
+                queryButton: queryAction.reason || 'UNKNOWN',
+              },
+            };
+          }
+        }
+      }
+    }
+
+    // 检查是否跳回统一身份认证页面；考试查询失败不能清空旧缓存。
+    for (const frame of page.frames()) {
+      const url = frame.url();
+      if (isAuthServerUrl(url)) {
+        authState.phase = 'session_expired';
+        authState.message = '教务系统登录会话已失效，请重新登录后查询考试。';
+        return { ok: false, message: authState.message };
+      }
+    }
+
+    // 兼容两种学校行为：跳转 xsksap_list，或仍停留 xsksap_query 并通过 AJAX 更新 DOM。
+    // Android 在点击后约 1 秒开始检查，并每 500 ms 检查一次，最多约 12 秒。
+    await page.waitForTimeout(1000);
+    let selected = null;
+    let parsed = { parser: 'njust-exam-empty', exams: [] };
+    let lastSnapshot = null;
+
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const candidateFrames = page.frames()
+        .filter((frame) => [EXAM_LIST_PATH, EXAM_QUERY_PATH].includes(framePath(frame)))
+        .sort((left, right) => Number(framePath(right) === EXAM_LIST_PATH) - Number(framePath(left) === EXAM_LIST_PATH));
+
+      for (const frame of candidateFrames) {
+        const snapshot = await frame.evaluate(() => {
+          const body = document.body;
+          const dataList = document.querySelector('#dataList');
+          const roots = dataList ? [dataList] : Array.from(document.querySelectorAll('table'));
+          let rowCount = 0;
+          const tables = roots.map((root) => {
+            const rows = Array.from(root.querySelectorAll('tr'));
+            rowCount += rows.filter((row) => row.querySelectorAll('td').length >= 7).length;
+            return {
+              rows: rows.length,
+              header: rows.slice(0, 2).map((row) => String(row.innerText || row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 180)),
+            };
+          });
+          return {
+            html: body ? body.innerHTML : '',
+            title: document.title || '',
+            path: document.location.pathname,
+            bodyCharacters: body ? (body.innerHTML || '').length : 0,
+            tableCount: document.querySelectorAll('table').length,
+            rowCount,
+            tables: tables.slice(0, 8),
+          };
+        }).catch(() => null);
+
+        if (!snapshot) continue;
+        lastSnapshot = snapshot;
+        const frameUrl = frame.url();
+        const candidateParsed = parseNjustExamHtml(snapshot.html, frameUrl);
+        if (candidateParsed.exams.length) {
+          selected = { frame, snapshot, url: frameUrl };
+          parsed = candidateParsed;
+          break;
+        }
+        if (snapshot.bodyCharacters > 0) {
+          selected = { frame, snapshot, url: frameUrl };
+          parsed = candidateParsed;
+        }
+      }
+
+      if (parsed.exams.length) break;
+      await page.waitForTimeout(500);
+    }
+
+    if (!parsed.exams.length) {
+      const diagnostics = {
+        page: selected ? safeLocation(selected.url) : safeLocation(page.url()),
+        title: selected?.snapshot?.title || await page.title().catch(() => ''),
+        parser: parsed.parser,
+        rowCount: lastSnapshot?.rowCount ?? 0,
+        bodyCharacters: lastSnapshot?.bodyCharacters ?? 0,
+        tableCount: lastSnapshot?.tableCount ?? 0,
+        tables: lastSnapshot?.tables ?? [],
+        frames: page.frames().map((frame) => safeFramePath(frame)),
+        queryAction: queryActionInfo,
+      };
+      const currentPath = selected?.snapshot?.path || (() => {
+        try { return new URL(page.url()).pathname; } catch { return ''; }
+      })();
+      const routeMessage = currentPath === EXAM_LIST_PATH
+        ? '已进入 xsksap_list，但暂未识别到考试记录'
+        : currentPath === EXAM_QUERY_PATH
+          ? '已执行查询按钮，但 xsksap_query 页面暂未出现可识别的考试记录'
+          : `考试查询后当前页面路径为 ${currentPath || '未知'}`;
+      return {
+        ok: false,
+        message: `${routeMessage}。原有考试缓存已保留。请检查脱敏诊断中的表格表头和行数。`,
+        diagnostics,
+      };
+    }
+
+    const now = new Date().toISOString();
+    await writeExamData({
+      school: '南京理工大学',
+      source: '南京理工大学学校原生考试查询按钮读取',
+      sourceUrl: safeSchoolUrl(selected.url),
+      lastSyncedAt: now,
+      exams: parsed.exams,
+    });
+
+    return {
+      ok: true,
+      count: parsed.exams.length,
+      lastSyncedAt: now,
+      message: `考试查询成功：通过学校原生查询流程读取到 ${parsed.exams.length} 条考试安排。`,
+      diagnostics: {
+        page: safeLocation(selected.url),
+        parser: parsed.parser,
+        tableCount: selected.snapshot.tableCount,
+        rowCount: selected.snapshot.rowCount,
+      },
+    };
+  } catch (error) {
+    const diagnostics = await inspectExamResultPage(page).catch(() => null);
+    return {
+      ok: false,
+      message: `考试读取失败：${String(error?.message || '未知错误').slice(0, 220)}。原有考试缓存已保留。`,
+      diagnostics,
+    };
+  }
+}
+
+
+async function diagnoseSchoolFlow() {
+  // One shared cookie jar and sequential requests. The previous diagnostic used a new jar
+  // for each URL, so its results could not describe a single navigation flow.
+  const jar = new CookieJar();
+  authState.trace = [];
+  const flow = await walkSchoolFlow(jar, { targetUrl: TARGET_URLS[0], phase: '匿名顺序探测', stopAtLoginForm: false });
+  authState.diagnostics = {
+    kind: 'ordered-flow-probe', steps: flow.results,
+    outcome: flow.kind,
+    note: '诊断按入口顺序访问，所有阶段共用一个临时 CookieJar。它是匿名探测：不会使用 Edge 会话、不会提交账号密码，也不会执行 EHALL 单页应用 JavaScript。已把服务卡片的 indexsso.jsp 作为独立阶段；如果 CAS 认证依赖额外的前端票据，仍需根据真实点击请求进一步适配。',
+  };
+  return { ok: true, diagnostics: authState.diagnostics, trace: authState.trace.slice(-24) };
+}
+
+const server = http.createServer(async (req, res) => {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  const requestOrigin = req.headers.origin || '';
+  if (requestOrigin && !/^http:\/\/(localhost|127\.0\.0\.1):5\d{3}$/.test(requestOrigin)) {
+    sendJson(res, 403, { ok: false, message: '仅允许本机 CampusTimetable 页面访问该接口。' }); return;
+  }
+  const requestUrl = new URL(req.url || '/', `http://${HOST}:${PORT}`);
+  try {
+    if (req.method === 'GET' && requestUrl.pathname === '/api/health') {
+      sendJson(res, 200, { ok: true, service: 'campus-timetable-local-bridge', port: PORT, mode: 'njust-cas-headless-edge-v11-captcha-policy', targetConfigured: Boolean(safeSchoolUrl(TARGET_URLS[0])) }); return;
+    }
+    if (req.method === 'GET' && requestUrl.pathname === '/api/timetable') { sendJson(res, 200, await readTimetable()); return; }
+    if (req.method === 'GET' && requestUrl.pathname === '/api/exams') { sendJson(res, 200, await readExamData()); return; }
+    if (req.method === 'DELETE' && requestUrl.pathname.startsWith('/api/exams/')) {
+      const examId = decodeURIComponent(requestUrl.pathname.slice('/api/exams/'.length));
+      const current = await readExamData();
+      const exams = current.exams.filter((exam) => exam.id !== examId);
+      if (exams.length !== current.exams.length) await writeExamData({ ...current, exams });
+      sendJson(res, 200, { ok: true, removed: current.exams.length - exams.length, exams }); return;
+    }
+    if (req.method === 'GET' && requestUrl.pathname === '/api/auth/status') {
+      if (authState.phase === 'connected' && Date.now() - authState.lastScanAt >= AUTO_REFRESH_MS) await scanTimetable(false);
+      sendJson(res, 200, publicAuthState()); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/diagnose') {
+      const result = await diagnoseSchoolFlow();
+      sendJson(res, 200, result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/start') {
+      const body = await readJsonBody(req);
+      const username = String(body.username || '').trim();
+      const password = String(body.password || '');
+      if (!username || !password) { sendJson(res, 400, { ok: false, message: '请输入学号和密码。' }); return; }
+      if (username.length > 100 || password.length > 500) { sendJson(res, 400, { ok: false, message: '账号或密码长度不合理。' }); return; }
+      const result = await beginLogin(username, password);
+      sendJson(res, result.ok ? 200 : (result.status || 422), result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/submit') {
+      const body = await readJsonBody(req);
+      const username = String(body.username || '').trim();
+      const password = String(body.password || '');
+      const captcha = String(body.captcha || '').trim();
+      if (authState.phase !== 'needs_captcha' || !authState.pending || !authState.page || !authState.browser) { sendJson(res, 409, { ok: false, message: '当前没有待处理的后台浏览器验证码会话，请重新登录。' }); return; }
+      if (!captcha) { sendJson(res, 400, { ok: false, message: '请输入验证码。' }); return; }
+      const result = await submitLogin(username, password, captcha);
+      sendJson(res, result.ok ? 200 : (result.status || 422), result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/scan') {
+      const result = await scanTimetable(true);
+      sendJson(res, result.ok ? 200 : 422, result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/exams') {
+      const result = await scanExams();
+      sendJson(res, result.ok ? 200 : 422, result); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/auth/close') {
+      await resetAuth(); authState.message = '已关闭本机后台认证会话并清除进程内存中的账号密码；不会向学校发起退出操作。';
+      sendJson(res, 200, { ok: true, ...publicAuthState() }); return;
+    }
+    if (req.method === 'POST' && requestUrl.pathname === '/api/sync') {
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.courses)) { sendJson(res, 400, { ok: false, message: '缺少 courses 数组' }); return; }
+      const courses = body.courses.map(normalizeCourse).filter(Boolean);
+      if (!courses.length) { sendJson(res, 422, { ok: false, message: '没有可保存的有效课程时段。' }); return; }
+      const now = new Date().toISOString();
+      await writeTimetable({ school: '南京理工大学', semester: String(body.semester || '').trim().slice(0, 100), source: '本机导入兼容接口', sourceUrl: safeSchoolUrl(body.sourceUrl), lastSyncedAt: now, courses });
+      sendJson(res, 200, { ok: true, message: `已保存 ${courses.length} 条课程时段`, lastSyncedAt: now, count: courses.length }); return;
+    }
+    sendJson(res, 404, { ok: false, message: '接口不存在' });
+  } catch (error) {
+    const causeCode = error?.cause?.code ? `（${String(error.cause.code).slice(0, 60)}）` : '';
+    const message = `${String(error?.message || '服务器内部错误')}${causeCode}`;
+    // Never log request bodies, usernames, passwords, cookies, or authentication response HTML.
+    console.error('本机 API 错误：', message);
+    if (requestUrl.pathname.startsWith('/api/auth/')) { authState.phase = 'error'; authState.error = message; authState.message = message; }
+    sendJson(res, error.statusCode || 500, { ok: false, phase: authState.phase, message, diagnostics: authState.diagnostics, trace: authState.trace.slice(-24) });
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`CampusTimetable 本机服务已启动：http://${HOST}:${PORT}`);
+  console.log(`认证模式：通过师生端应用启动入口 ${SSO_ENTRY_HTTPS} 发起 CAS 认证，再读取 ${new URL(TARGET_URLS[0]).hostname} 课表`);
+  console.log('账号密码只提交到 HTTPS CAS 表单，不落盘、不打印日志。学校官方 indexsso.jsp callback 使用 HTTP，一次性 CAS ticket 可能通过 HTTP 传到 bkjw；请勿在不可信网络环境测试。');
+  console.log('如需指定已确认的师生端 HTTPS 课表地址，可设置环境变量 TIMETABLE_TARGET_URL。');
+});

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { parseNjustTimetableHtml, parseNjustLoginForm } from './njust-parser.mjs';
+import { parseNjustExamHtml } from './njust-exam-parser.mjs';
 
 const html = `<!doctype html><html><head><title>学期理论课表</title></head><body>
 <select id="xnxq01id"><option value="2026-2027-1" selected="selected">2026-2027-1</option></select>
@@ -29,3 +30,29 @@ assert.equal(login.passwordName, 'password');
 assert.equal(login.captchaName, 'captchaResponse');
 assert.equal(login.action, 'https://ids.njust.edu.cn/authserver/login?service=x');
 console.log('Parser smoke test passed:', parsed.courses.length, 'course slots; auth form parser passed.');
+
+
+const examHtml = `<!doctype html><html><body>
+<table id="dataList"><tr><th>序号</th><th>考试场次</th><th>课程编号</th><th>课程名称</th><th>考试时间</th><th>考场</th><th>座位号</th></tr>
+<tr><td>1</td><td>2026-001</td><td>06036001</td><td>软件工程</td><td>2026-12-18 09:00-11:00</td><td>第四教学楼 A203</td><td>18</td></tr>
+<tr><td>2</td><td>2026-002</td><td>06036002</td><td>数据结构</td><td>2026年12月20日 14:00-16:00</td><td>第二教学楼 302</td><td>07</td></tr>
+</table></body></html>`;
+const exams = parseNjustExamHtml(examHtml, 'https://bkjw.njust.edu.cn/njlgdx/xsks/xsksap_list');
+assert.equal(exams.exams.length, 2);
+assert.equal(exams.exams[0].name, '软件工程');
+assert.equal(exams.exams[0].date, '2026-12-18');
+assert.equal(exams.exams[0].time, '09:00-11:00');
+assert.equal(exams.exams[0].room, '第四教学楼 A203');
+assert.equal(exams.exams[0].seatNumber, '18');
+assert.equal(exams.exams[1].date, '2026-12-20');
+assert.equal(exams.exams[1].source, 'school');
+console.log('Exam parser smoke test passed:', exams.exams.length, 'seven-column exam rows.');
+
+const namedExamHtml = `<html><body><table><tr><th>课程名称</th><th>考试日期</th><th>考场</th><th>座位号</th><th>课程编号</th></tr>
+<tr><td>高等数学</td><td>2026/12/22 08:30-10:30</td><td>第三教学楼 101</td><td>21</td><td>07001001</td></tr></table></body></html>`;
+const namedExams = parseNjustExamHtml(namedExamHtml);
+assert.equal(namedExams.exams.length, 1);
+assert.equal(namedExams.exams[0].name, '高等数学');
+assert.equal(namedExams.exams[0].date, '2026-12-22');
+assert.equal(namedExams.exams[0].seatNumber, '21');
+console.log('Exam parser named-header fallback passed:', namedExams.exams.length, 'exam row.');

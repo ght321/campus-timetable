@@ -19,7 +19,7 @@ test("desktop CRUD, conflict confirmation, search, persistence and deletion", as
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
   await expect(
-    page.getByText("真实当前第 7 教学周", { exact: false }),
+    page.getByText("真实当前第 9 教学周", { exact: false }),
   ).toBeVisible();
   const form = await addCourse(page, "软件工程实践");
   await expect(form.getByText("发现时间冲突")).toBeVisible();

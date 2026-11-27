@@ -11,11 +11,26 @@ export type LoadResult = {
 export function loadData(storage: StoragePort): LoadResult {
   try {
     const raw = storage.getItem(STORAGE_KEY);
-    return {
-      data: raw === null ? { ...demoData(), courses: [] } : validateData(JSON.parse(raw)),
-      warning: "",
-      writable: true,
-    };
+    const loaded = raw === null ? { ...demoData(), courses: [] } : validateData(JSON.parse(raw));
+    // The previous provisional default for 2026-2027-1 was 2026-09-07.
+    // Migrate that known default (including a fresh install) to the user's
+    // confirmed semester first day. Any other user-configured date is preserved.
+    const shouldMigrate = loaded.semester.name === "2026-2027-1" && loaded.semester.startDate === "2026-09-07";
+    const data = shouldMigrate
+      ? validateData({ ...loaded, semester: { ...loaded.semester, startDate: "2026-08-24" } })
+      : loaded;
+    if (shouldMigrate && raw !== null) {
+      try {
+        storage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch {
+        return {
+          data,
+          warning: "学期第一天已校正为 2026-08-24，但浏览器暂未允许自动写回；请在个人信息中保存一次。",
+          writable: true,
+        };
+      }
+    }
+    return { data, warning: "", writable: true };
   } catch {
     return {
       data: demoData(),

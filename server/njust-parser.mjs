@@ -133,6 +133,113 @@ export function parseNjustTimetableHtml(html, sourceUrl = '') {
   return { title, semester, sourceUrl, parser: 'njust-dataList', courses };
 }
 
+/**
+ * Parse NJUST's xsksap_list exam results.
+ * Supports the known seven-column dataList layout and future named-header tables.
+ * The parser only reads result-table cells; it never extracts credentials or cookies.
+ */
+export function parseNjustExamHtml(html, sourceUrl = '') {
+  const source = String(html || '');
+  if (!source.trim()) return { sourceUrl, parser: 'njust-exam-empty', exams: [] };
+
+  const tables = [...source.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table\s*>/gi)].map((m) => m[1]);
+  const dataList = tableInner(source, 'dataList');
+  const candidates = dataList ? [dataList] : tables;
+  const tidy = (value) => clean(value).replace(/[\u00a0\u3000]/g, ' ').replace(/\s+/g, ' ').trim();
+  const parseDate = (value) => {
+    const match = String(value || '').match(/(20\d{2})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?/);
+    if (!match) return '';
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return '';
+    return `${match[1]}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  };
+  const parseTime = (value) => {
+    const text = String(value || '');
+    const range = text.match(/\d{1,2}:\d{2}\s*[-~～至到—–]\s*\d{1,2}:\d{2}/);
+    if (range) return range[0].replace(/\s+/g, '');
+    const date = text.match(/(20\d{2})\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}\s*日?/);
+    return date ? text.slice(date.index + date[0].length).trim() || '时间待公布' : text.trim() || '时间待公布';
+  };
+
+  let selected = null;
+  let headerIndexes = null;
+  for (const table of candidates) {
+    const rows = rowsOf(table);
+    if (rows.length < 2) continue;
+    const headers = (rows[0] ? cellsOf(rows[0]) : []).map(tidy);
+    const find = (patterns) => headers.findIndex((header) => patterns.some((pattern) => pattern.test(header)));
+    const named = {
+      name: find([/考试名称/, /课程名称/, /科目名称/, /^考试科目$/, /^课程$/]),
+      date: find([/考试日期/, /^日期$/, /考试时间/, /^时间$/]),
+      room: find([/考试地点/, /考试教室/, /^地点$/, /^教室$/, /^考场$/]),
+      level: find([/考试级别/, /考试类型/, /类别/, /等级/]),
+      invigilator: find([/监考教师/, /监考人/]),
+      examNumber: find([/考试场次/, /场次/, /考试编号/]),
+      courseCode: find([/课程编号/, /课程代码/, /课程号/]),
+      seat: find([/座位号/, /座号/, /座位/]),
+    };
+    const hasNamedHeaders = named.name >= 0 && (named.date >= 0 || named.room >= 0);
+    const hasSevenColumnRows = rows.slice(1).some((row) => {
+      const values = cellsOf(row).map(tidy);
+      return values.length >= 7 && Boolean(parseDate(values[4]));
+    });
+    if (hasNamedHeaders || hasSevenColumnRows) {
+      selected = { rows, named, hasNamedHeaders };
+      break;
+    }
+  }
+  if (!selected) return { sourceUrl, parser: 'njust-exam-unrecognized', exams: [] };
+
+  const parsed = [];
+  const seen = new Set();
+  for (let rowIndex = 1; rowIndex < selected.rows.length; rowIndex++) {
+    const values = cellsOf(selected.rows[rowIndex]).map(tidy);
+    if (!values.length) continue;
+    let sequence = values[0] || String(rowIndex);
+    let examNumber = '';
+    let courseCode = '';
+    let name = '';
+    let dateTime = '';
+    let room = '';
+    let seatNumber = '';
+    let level = '';
+    let invigilator = '';
+
+    if (selected.hasNamedHeaders) {
+      const indexes = selected.named;
+      name = values[indexes.name] || '';
+      dateTime = indexes.date >= 0 ? values[indexes.date] || '' : '';
+      room = indexes.room >= 0 ? values[indexes.room] || '' : '';
+      examNumber = indexes.examNumber >= 0 ? values[indexes.examNumber] || '' : '';
+      courseCode = indexes.courseCode >= 0 ? values[indexes.courseCode] || '' : '';
+      seatNumber = indexes.seat >= 0 ? values[indexes.seat] || '' : '';
+      level = indexes.level >= 0 ? values[indexes.level] || '' : '';
+      invigilator = indexes.invigilator >= 0 ? values[indexes.invigilator] || '' : '';
+    } else {
+      [, examNumber, courseCode, name, dateTime, room, seatNumber] = values;
+    }
+
+    if (!name || /暂无|无考试|没有考试/.test(name)) continue;
+    const date = parseDate(dateTime) || '日期待公布';
+    const time = parseTime(dateTime);
+    const key = [examNumber, courseCode, name, date, time, room, seatNumber].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const id = `njust-${examNumber || sequence || rowIndex}-${courseCode}-${date}`.replace(/[^\w\u4e00-\u9fff-]/g, '-').slice(0, 220);
+    parsed.push({
+      id, name: name.slice(0, 160), date, time,
+      room: (room || '暂未安排').slice(0, 160),
+      seatNumber: (seatNumber || '暂未安排').slice(0, 80),
+      examNumber: examNumber.slice(0, 80), courseCode: courseCode.slice(0, 80),
+      level: (level || '学校考试安排').slice(0, 80),
+      invigilator: invigilator.slice(0, 120), source: 'school',
+    });
+  }
+  parsed.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+  return { sourceUrl, parser: parsed.length ? 'njust-xsksap-list' : 'njust-exam-no-records', exams: parsed.slice(0, 500) };
+}
+
 export function parseNjustLoginForm(html, currentUrl) {
   const forms = [...String(html).matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form\s*>/gi)];
   const candidate = forms.find((m) => /type\s*=\s*["']password["']/i.test(m[2])) || null;
