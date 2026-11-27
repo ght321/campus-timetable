@@ -1,0 +1,98 @@
+.real-sync-panel {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 24px;
+  padding: 20px 22px;
+  border: 1px solid #dce5ef;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(28, 48, 76, 0.05);
+}
+.real-sync-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.real-sync-eyebrow {
+  margin: 0 0 5px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+.real-sync-heading h2 {
+  margin: 0;
+  color: #17253b;
+  font-size: 20px;
+}
+.real-sync-heading p:last-child {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+.real-sync-status {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 650;
+}
+.real-sync-status.is-online { background: #ecfdf5; color: #047857; }
+.real-sync-status.is-offline { background: #fff7ed; color: #b45309; }
+.real-sync-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.real-sync-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; color: #64748b; font-size: 12px; }
+.real-sync-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.real-sync-fields label, .real-sync-captcha label {
+  display: grid;
+  gap: 6px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 650;
+}
+.real-sync-fields input, .real-sync-captcha input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #fff;
+  color: #17253b;
+  font: inherit;
+}
+.real-sync-fields input:focus, .real-sync-captcha input:focus {
+  outline: 2px solid rgba(37, 99, 235, .18);
+  border-color: #3b82f6;
+}
+.real-sync-captcha { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; }
+.real-sync-captcha img { display: block; max-width: 150px; min-height: 42px; object-fit: contain; border: 1px solid #e2e8f0; border-radius: 8px; }
+.real-sync-captcha label { flex: 1 1 180px; }
+.real-sync-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+.real-sync-actions button, .real-sync-captcha button {
+  min-height: 38px;
+  padding: 8px 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #fff;
+  color: #334155;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.real-sync-actions button.real-sync-primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+.real-sync-actions button:disabled, .real-sync-captcha button:disabled { opacity: .55; cursor: not-allowed; }
+.real-sync-message { margin: 0; padding: 10px 12px; border-radius: 9px; background: #f8fafc; color: #334155; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.real-sync-note { margin: 0; color: #94a3b8; font-size: 11px; line-height: 1.6; }
+@media (max-width: 640px) {
+  .real-sync-panel { padding: 16px; }
+  .real-sync-heading { flex-direction: column; }
+  .real-sync-fields { grid-template-columns: 1fr; }
+  .real-sync-actions button { flex: 1 1 auto; }
+}

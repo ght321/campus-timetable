@@ -57,6 +57,11 @@ describe("calendar and teaching weeks", () => {
     expect(teachingWeek(s, "2026-09-13")).toBe(1);
     expect(teachingWeek(s, "2026-09-14")).toBe(2);
   });
+  it("calculates the confirmed 2026-2027-1 first day as teaching week 14 on 2026-11-27", () => {
+    const semester = { ...data.semester, name: "2026-2027-1", startDate: "2026-08-24" };
+    expect(teachingWeek(semester, "2026-11-27")).toBe(14);
+    expect(visibleWeek(semester, "2026-11-27")).toBe(14);
+  });
   it("keeps out-of-term actual weeks separate from clamped navigation", () => {
     expect(teachingWeek(data.semester, "2026-09-06")).toBe(0);
     expect(visibleWeek(data.semester, "2026-09-06")).toBe(1);
@@ -209,12 +214,17 @@ describe("storage recovery", () => {
       raw = value;
     },
   });
-  it("initializes examples only when key is absent", () =>
-    expect(loadData(storage(null))).toEqual({
-      data,
-      warning: "",
-      writable: true,
-    }));
+  it("initializes an empty timetable and migrates the 2026-2027-1 first day", () => {
+    const result = loadData(storage(null));
+    expect(result.data.courses).toEqual([]);
+    if (data.semester.name === "2026-2027-1" && data.semester.startDate === "2026-09-07") {
+      expect(result.data.semester.startDate).toBe("2026-08-24");
+    } else {
+      expect(result.data.semester.startDate).toBe(data.semester.startDate);
+    }
+    expect(result.warning).toBe("");
+    expect(result.writable).toBe(true);
+  });
   it("preserves a valid empty timetable", () =>
     expect(
       loadData(storage(JSON.stringify({ ...data, courses: [] }))).data.courses,
